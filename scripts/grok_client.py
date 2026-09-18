@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 from time import time
 
@@ -25,26 +26,28 @@ def run_text_prompt(
     *,
     max_turns: int = 2,
     tools: tuple[str, ...] = (),
-    fallback: bool = True,
+    fallback: bool = False,
 ) -> dict:
     """Run Grok with an optional bounded tool set and normalize its result."""
-    cmd = [
-        GROK_BIN,
-        "-p", prompt,
-        "--output-format", "json",
-        "--always-approve",
-        "--tools", ",".join(tools),
-        "--no-subagents",
-        "--disable-web-search",
-        "--max-turns", str(max_turns),
-        "--cwd", str(cwd),
-    ]
-    if GROK_MODEL:
-        cmd += ["-m", GROK_MODEL]
-
+    if tools:
+        raise ValueError("memory adapter is tool-free")
     started = time()
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=GROK_TIMEOUT)
+        with tempfile.TemporaryDirectory(prefix="cmc-grok-") as isolated:
+            cmd = [
+                GROK_BIN,
+                "-p", prompt,
+                "--output-format", "json",
+                "--always-approve",
+                "--tools", "",
+                "--no-subagents",
+                "--disable-web-search",
+                "--max-turns", str(max_turns),
+                "--cwd", isolated,
+            ]
+            if GROK_MODEL:
+                cmd += ["-m", GROK_MODEL]
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=GROK_TIMEOUT)
     except subprocess.TimeoutExpired:
         result = {"ok": False, "engine": "grok", "error": f"timeout after {GROK_TIMEOUT}s"}
         return _fallback(result, prompt, cwd, tools) if fallback else result
@@ -88,17 +91,5 @@ def run_text_prompt(
 
 
 def _fallback(result: dict, prompt: str, cwd: Path, tools: tuple[str, ...]) -> dict:
-    try:
-        from alerts import notify
-        from luna_client import run_luna
-    except ModuleNotFoundError:
-        from scripts.alerts import notify
-        from scripts.luna_client import run_luna
-
-    notify(cwd, "Grok", str(result.get("error") or "unknown error"))
-    luna = run_luna(prompt, cwd, writable=bool({"Write", "Edit"}.intersection(tools)))
-    luna["fallback_from"] = "grok"
-    luna["grok_error"] = result.get("error")
-    if not luna.get("ok"):
-        notify(cwd, "Luna", str(luna.get("error") or "unknown error"))
-    return luna
+    """Compatibility shim: only model_client may choose another provider."""
+    return result

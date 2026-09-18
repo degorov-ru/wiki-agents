@@ -41,11 +41,14 @@ from config import (
     ensure_state_dir,
     memory_enabled,
 )
+from memory_contract import redact_sensitive
+from pending import project_lock
+from path_safety import append_text, atomic_write_text
 
 ensure_state_dir()
 
 logging.basicConfig(
-    filename=str(FLUSH_LOG_FILE),
+    filename=None if FLUSH_LOG_FILE.is_symlink() else str(FLUSH_LOG_FILE),
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
@@ -62,15 +65,19 @@ def load_flush_state() -> dict:
 
 
 def save_flush_state(state: dict) -> None:
-    FLUSH_STATE_FILE.write_text(json.dumps(state), encoding="utf-8")
+    atomic_write_text(FLUSH_STATE_FILE, json.dumps(state))
 
 
-def append_to_daily_log(content: str, section: str = "Session") -> None:
+def append_to_daily_log(content: str, section: str = "Session", session_id: str = "unknown",
+                        event_key: str | None = None) -> bool:
     """Append content to today's daily log inside the current project."""
     today = datetime.now(timezone.utc).astimezone()
     daily_date = os.environ.get("CMC_DAILY_DATE", today.strftime("%Y-%m-%d"))
     log_path = DAILY_DIR / f"{daily_date}.md"
     lock_path = STATE_DIR / "daily.lock"
+
+    if log_path.is_symlink() or lock_path.is_symlink():
+        raise ValueError("unsafe daily log path")
 
     if not log_path.exists():
         DAILY_DIR.mkdir(parents=True, exist_ok=True)
@@ -80,7 +87,14 @@ def append_to_daily_log(content: str, section: str = "Session") -> None:
         )
 
     time_str = today.strftime("%H:%M")
-    entry = f"### {section} ({time_str})\n\n{content}\n\n"
+    identity = f"{daily_date}\0{event_key or content}"
+    event_id = f"m-{daily_date.replace('-', '')}-{hashlib.sha256(identity.encode()).hexdigest()[:10]}"
+    entry = (
+        f"### {event_id} | {section} ({time_str})\n\n"
+        f"**Session:** `{session_id}`  \n"
+        f"**Evidence:** model summary; original transcript may be unavailable\n\n"
+        f"{content}\n\n"
+    )
 
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     with open(lock_path, "a+", encoding="utf-8") as lock:
@@ -93,17 +107,20 @@ def append_to_daily_log(content: str, section: str = "Session") -> None:
 
             msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
         try:
-            with open(log_path, "a", encoding="utf-8") as f:
-                f.write(entry)
+            if event_id in log_path.read_text(encoding="utf-8"):
+                return False
+            append_text(log_path, entry)
         finally:
             if sys.platform != "win32":
                 fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
             else:
                 msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+    return True
 
 
 def run_flush(context: str) -> tuple[str, dict]:
     """Use Grok to extract important knowledge from conversation context."""
+    context, redacted = redact_sensitive(context)
     prompt = f"""Review the conversation context below and respond with a concise summary
 of important items that should be preserved in the daily log.
 Do NOT use any tools — just return plain text.
@@ -129,6 +146,9 @@ Skip anything that is:
 - Content that's trivial or obvious
 - Trivial back-and-forth or clarification exchanges
 
+Preserve exact names, ports, IDs, and other values when they are part of a
+durable fact or decision; do not replace them with vague references.
+
 Only include sections that have actual content. If nothing is worth saving,
 respond with exactly: FLUSH_OK
 
@@ -141,6 +161,8 @@ respond with exactly: FLUSH_OK
     result = run_text_prompt(prompt, PROJECT_DIR, max_turns=2)
     if not result.get("ok"):
         return "", result
+    if redacted:
+        result["redacted"] = True
     return str(result.get("text") or ""), result
 
 
@@ -155,12 +177,34 @@ def maybe_trigger_compilation() -> None:
 
 
 def main():
+    # ponytail: serialize per-project model flushes; per-item locks if throughput matters.
+    with project_lock(PROJECT_DIR, "flush"):
+        _main_locked()
+
+
+def _remove_context(context_file: Path) -> None:
+    with project_lock(PROJECT_DIR):
+        context_file.unlink(missing_ok=True)
+        context_file.with_suffix(".retry.json").unlink(missing_ok=True)
+
+
+def _main_locked():
+    if (STATE_DIR / "purge-paused").exists():
+        return
     if len(sys.argv) < 3:
         logging.error("Usage: %s <context_file.md> <session_id> [project_dir]", sys.argv[0])
         sys.exit(1)
 
     context_file = Path(sys.argv[1])
     session_id = sys.argv[2]
+
+    try:
+        safe_context = context_file.resolve().is_relative_to(STATE_DIR.resolve())
+    except OSError:
+        safe_context = False
+    if not safe_context or not context_file.is_file():
+        logging.error("Context must be a regular file inside the project .cmc directory")
+        return
 
     logging.info(
         "flush.py started for session %s in project %s, context: %s",
@@ -169,7 +213,7 @@ def main():
 
     if not memory_enabled():
         logging.info("SKIP: memory not enabled for project %s (no wiki/ dir)", PROJECT_DIR)
-        context_file.unlink(missing_ok=True)
+        _remove_context(context_file)
         return
 
     if not context_file.exists():
@@ -179,7 +223,7 @@ def main():
     context = context_file.read_text(encoding="utf-8").strip()
     if not context:
         logging.info("Context file is empty, skipping")
-        context_file.unlink(missing_ok=True)
+        _remove_context(context_file)
         return
 
     # Dedupe by CONTENT hash, not session_id+time window: per-turn capture flushes
@@ -193,7 +237,7 @@ def main():
         recent_hashes = []
     if content_hash in recent_hashes:
         logging.info("Skipping duplicate flush (content hash %s)", content_hash)
-        context_file.unlink(missing_ok=True)
+        _remove_context(context_file)
         return
 
     logging.info(
@@ -211,10 +255,10 @@ def main():
         maybe_trigger_compilation()
         return
     if response.strip() == "FLUSH_OK":
-        logging.info("Result: FLUSH_OK engine=grok")
+        logging.info("Result: FLUSH_OK engine=%s", result.get("engine", "unknown"))
     else:
-        logging.info("Result: saved to daily log (%d chars) engine=grok", len(response))
-        append_to_daily_log(response, "Session")
+        logging.info("Result: saved to daily log (%d chars) engine=%s", len(response), result.get("engine", "unknown"))
+        append_to_daily_log(response, "Session", session_id, content_hash)
 
     recent_hashes.append(content_hash)
     save_flush_state(
@@ -224,7 +268,7 @@ def main():
             "timestamp": time.time(),
         }
     )
-    context_file.unlink(missing_ok=True)
+    _remove_context(context_file)
 
     maybe_trigger_compilation()
     logging.info("Flush complete for session %s", session_id)

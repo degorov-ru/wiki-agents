@@ -1,4 +1,4 @@
-# LLM Personal Knowledge Base
+# Wiki Agents
 
 Русский · [English](docs/README.en.md) · [Español](docs/README.es.md)
 
@@ -10,6 +10,10 @@
 при желании резервный движок.
 
 ## Быстрый старт
+
+Для установки на другом компьютере начни со [START-HERE.md](START-HERE.md):
+там готовое сообщение агенту, границы доступа и критерии успешной установки.
+Происхождение кода и сведения о лицензии: [LICENSING.md](LICENSING.md).
 
 Отправь агенту ссылку на репозиторий и этот текст:
 
@@ -37,28 +41,52 @@ Conversation -> Claude SessionEnd/PreCompact or Codex Stop hooks -> flush.py ext
 
 - **Hooks** capture conversations automatically (Claude session end/pre-compaction and Codex Stop)
 - **flush.py** calls the configured memory engine to decide what's worth saving, retains failed inputs for retry, and after 04:00 triggers compilation automatically
-- **compile.py** turns daily logs into organized concept articles with cross-references (triggered automatically or run manually)
+- **compile.py** validates a read-only model proposal, then code writes organized articles
 - **query.py** answers questions using index-guided retrieval (no RAG needed at personal scale)
-- **lint.py** runs 7 health checks (broken links, orphans, contradictions, staleness)
+- **lint.py** checks links, sources, schema, staleness, and optional contradictions
 
 ## Key Commands
 
 ```bash
 uv run python scripts/compile.py                    # compile new daily logs
 uv run python scripts/query.py "question"            # ask the knowledge base
-uv run python scripts/query.py "question" --file-back # ask + save answer back
 uv run python scripts/lint.py                        # run health checks
 uv run python scripts/lint.py --structural-only      # free structural checks only
+uv run python scripts/manage.py status --project /path/to/project
+uv run python scripts/manage.py doctor --project /path/to/project
+uv run python scripts/manage.py pause                # pause this checkout's hooks
+uv run python scripts/manage.py resume
 ```
 
 Set `CMC_PROJECT_ROOTS` to an OS-path-separated list of project roots. Machine-local
 roots, runtime logs, `.cmc/`, `daily/`, and generated wiki content must not be committed
 to a shared compiler repository.
 
-## Why No RAG?
+## Why No Vector Database?
 
-Karpathy's insight: at personal scale (50-500 articles), the LLM reading a structured `index.md` outperforms vector similarity. The LLM understands what you're really asking; cosine similarity just finds similar words. RAG becomes necessary at ~2,000+ articles when the index exceeds the context window.
+The default query path uses deterministic index-term matching and sends no more
+than six current articles within a fixed context budget. This keeps the product
+simple; it does not claim to outperform semantic retrieval. Add another retrieval
+layer only after measured misses justify it.
+
+## Supported installation and updates
+
+Tested platform: macOS with Python 3.12+, `uv`, and an authenticated Luna CLI.
+Linux/Windows and live Haiku/Grok operation remain unverified. CLI hook testing
+does not establish Desktop hook trust; follow [INSTALL.md](INSTALL.md).
+
+Use a new versioned directory for updates, never overwrite a dirty installation.
+Keep the previous directory and machine configuration until the pilot passes.
+`manage.py upgrade` backs up project instructions, hooks, index/log and articles;
+`rollback --backup` restores that snapshot. Uninstall removes hooks, not memory.
+Legacy metadata migration is explicit and preview-first; see INSTALL.md.
+
+Distribution artifact: source-only `tar.gz` built by `scripts/release_check.py
+--build /path/to/package.tar.gz`. Extract into a permanent directory, run
+`uv sync`, then install as described above. Machine settings and project memory
+are excluded. See [LICENSING.md](LICENSING.md) for provenance and licensing status.
 
 ## Technical Reference
 
-See **[AGENTS.md](AGENTS.md)** for the complete technical reference: article formats, hook architecture, script internals, cross-platform details, costs, and customization options. AGENTS.md is designed to give an AI agent everything it needs to understand, modify, or rebuild the system.
+See **[AGENTS.md](AGENTS.md)** for the technical reference: article formats, hook
+architecture, script internals, known platform limits, and customization options.

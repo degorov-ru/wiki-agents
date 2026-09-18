@@ -13,8 +13,14 @@ import time
 from datetime import date, datetime
 from pathlib import Path
 
-
 TOOL_ROOT = Path(__file__).resolve().parent.parent
+SCRIPTS_DIR = TOOL_ROOT / "scripts"
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+
+from memory_contract import redact_sensitive
+from path_safety import atomic_write_text, managed_dir, validate_layout
+
 FLUSH_SCRIPT = TOOL_ROOT / "scripts" / "flush.py"
 SECRET_PATTERNS = (
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
@@ -54,7 +60,7 @@ def message(payload: dict) -> tuple[str | None, str | None]:
 
 def session_turns(path: Path) -> list[str]:
     turns: list[str] = []
-    seen: set[tuple[str, str]] = set()
+    previous: tuple[str, str] | None = None
     try:
         with path.open(encoding="utf-8") as handle:
             for line in handle:
@@ -66,9 +72,9 @@ def session_turns(path: Path) -> list[str]:
                 if not isinstance(payload, dict):
                     continue
                 role, text = message(payload)
-                if not role or not text or (role, text) in seen:
+                if not role or not text or (role, text) == previous:
                     continue
-                seen.add((role, text))
+                previous = (role, text)
                 turns.append(f"**{role}:** {re.sub(r'\n{3,}', '\n\n', text)}\n")
     except OSError:
         return []
@@ -91,7 +97,11 @@ def chunks(turns: list[str], max_turns: int = 30, max_chars: int = 15_000) -> li
 
 
 def has_secret(text: str) -> bool:
-    return any(pattern.search(text) for pattern in SECRET_PATTERNS)
+    return redact_sensitive(text)[1]
+
+
+def valid_session_id(value: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,199}", value))
 
 
 def project_roots(roots: list[Path]) -> set[Path]:
@@ -110,8 +120,7 @@ def load_state(path: Path) -> dict:
 
 
 def save_state(path: Path, state: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+    atomic_write_text(path, json.dumps(state, indent=2, ensure_ascii=False))
 
 
 def main() -> int:
@@ -154,6 +163,8 @@ def main() -> int:
         if session_date < since:
             continue
         session_id = str(meta.get("id") or path.stem)
+        if not valid_session_id(session_id):
+            continue
         turns = session_turns(path)
         if turns:
             planned.setdefault(project, []).append((path, session_id, turns))
@@ -164,6 +175,7 @@ def main() -> int:
         print(f"{project}: {len(items)} session(s)")
         if not args.run:
             continue
+        validate_layout(project, create_state=True)
         state_path = project / ".cmc" / "codex-backfill.json"
         state = load_state(state_path)
         processed = state.setdefault("processed", {})
@@ -178,9 +190,14 @@ def main() -> int:
                     print(f"SKIP secret-like content: {session_id} part {part}")
                     session_ok = False
                     continue
-                context_file = project / ".cmc" / "backfill" / f"{session_id}-{part}.md"
-                context_file.parent.mkdir(parents=True, exist_ok=True)
-                context_file.write_text(context, encoding="utf-8")
+                backfill_dir = managed_dir(project, ".cmc") / "backfill"
+                if backfill_dir.is_symlink():
+                    raise ValueError("unsafe backfill directory")
+                backfill_dir.mkdir(exist_ok=True)
+                context_file = backfill_dir / f"{session_id}-{part}.md"
+                if context_file.is_symlink():
+                    raise ValueError("unsafe backfill context path")
+                atomic_write_text(context_file, context)
                 env = os.environ.copy()
                 env["CMC_PROJECT_DIR"] = str(project)
                 env["CMC_DAILY_DATE"] = session_date

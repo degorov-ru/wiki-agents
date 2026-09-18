@@ -19,7 +19,7 @@ import json
 import os
 import subprocess
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Recursion guard: skip when running inside an Agent SDK session spawned by
@@ -30,6 +30,21 @@ if os.environ.get("CLAUDE_INVOKED_BY"):
 _TOOL_ROOT = Path(__file__).resolve().parent.parent
 if (_TOOL_ROOT / ".disabled-by-codex").exists() or os.environ.get("CMC_DISABLED") == "1":
     sys.exit(0)
+
+
+def _safe_dir(path: Path, parent: Path) -> Path | None:
+    if path.is_symlink() or not path.is_dir():
+        return None
+    resolved = path.resolve()
+    return resolved if resolved.is_relative_to(parent.resolve()) else None
+
+
+def _safe_file(path: Path, root: Path) -> Path | None:
+    safe_root = _safe_dir(root, root.parent)
+    if safe_root is None or path.is_symlink() or not path.is_file():
+        return None
+    resolved = path.resolve()
+    return resolved if resolved.is_relative_to(safe_root) else None
 
 
 def _config_int(name: str, default: int) -> int:
@@ -44,7 +59,7 @@ def _config_int(name: str, default: int) -> int:
 
 def _load_project_config(project_dir: Path) -> dict:
     cfg_path = project_dir / ".cmc-config.json"
-    if not cfg_path.exists():
+    if _safe_file(cfg_path, project_dir) is None:
         return {}
     try:
         return json.loads(cfg_path.read_text(encoding="utf-8"))
@@ -61,16 +76,14 @@ def _budget(project_dir: Path) -> tuple[int, int, int]:
 
 
 def _read_recent_daily(daily_dir: Path, max_lines: int) -> str:
-    if not daily_dir.exists():
+    if _safe_dir(daily_dir, daily_dir.parent) is None:
         return "(no recent daily log)"
-    today = datetime.now(timezone.utc).astimezone()
-    for offset in range(3):
-        date = today - timedelta(days=offset)
-        log_path = daily_dir / f"{date.strftime('%Y-%m-%d')}.md"
-        if log_path.exists():
-            lines = log_path.read_text(encoding="utf-8").splitlines()
-            tail = lines[-max_lines:] if len(lines) > max_lines else lines
-            return "\n".join(tail)
+    logs = [path for path in sorted(daily_dir.glob("*.md"))
+            if _safe_file(path, daily_dir) is not None]
+    if logs:
+        lines = logs[-1].read_text(encoding="utf-8").splitlines()
+        tail = lines[-max_lines:] if len(lines) > max_lines else lines
+        return "\n".join(tail)
     return "(no recent daily log)"
 
 
@@ -131,6 +144,8 @@ def _maybe_migrate_ai_memory(project_dir: Path) -> str | None:
     """If ai-memory/ exists and wiki/ doesn't, run the migration script."""
     ai_memory = project_dir / "ai-memory"
     wiki = project_dir / "wiki"
+    if ai_memory.is_symlink() or wiki.is_symlink():
+        return "(migration refused: managed path is a symlink)"
     if not ai_memory.is_dir() or wiki.exists():
         return None
 
@@ -182,6 +197,8 @@ def _allowed_to_auto_init(project_dir: Path) -> bool:
 
 def _maybe_init_project(project_dir: Path) -> str | None:
     """Create the memory scaffold for projects that do not have wiki/ yet."""
+    if (project_dir / "wiki").is_symlink():
+        return "(memory refused: wiki is a symlink)"
     if (project_dir / "wiki").exists():
         return None
 
@@ -235,6 +252,10 @@ def build_context(project_dir: Path) -> str:
         f"## Today\n{today.strftime('%A, %B %d, %Y')}",
     ]
 
+    if (project_dir / ".cmc" / "purge-paused").exists():
+        parts.append("## Memory\n\n(paused: controlled purge is incomplete)")
+        return "\n\n---\n\n".join(parts)
+
     migration_note = _maybe_migrate_ai_memory(project_dir)
     if migration_note:
         parts.append(f"## Migration\n{migration_note}")
@@ -248,17 +269,18 @@ def build_context(project_dir: Path) -> str:
     index_file = wiki_dir / "index.md"
     access_file = project_dir / "ACCESS.md"
 
-    if access_file.exists():
+    if _safe_file(access_file, project_dir) is not None:
         access = access_file.read_text(encoding="utf-8")
         parts.append(f"## Access Registry\n\n{_truncate(access, 4_000)}")
 
-    if not wiki_dir.exists():
+    safe_wiki = _safe_dir(wiki_dir, project_dir)
+    if safe_wiki is None:
         parts.append(
             "## Wiki\n\n(no wiki: memory is opt-in for this directory — "
             "run scripts/init_project.py from claude-memory-compiler to enable)"
         )
     else:
-        if index_file.exists():
+        if _safe_file(index_file, wiki_dir) is not None:
             idx = index_file.read_text(encoding="utf-8")
             parts.append(f"## Wiki Index\n\n{_truncate(idx, max_index)}")
         else:

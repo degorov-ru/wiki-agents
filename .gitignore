@@ -38,6 +38,7 @@ Thumbs.db
 # Machine-local configuration and runtime artifacts
 auto-init-roots.json
 engine.json
+.disabled-by-codex
 *.plist.disabled-backup
 *.log
 **/.cmc/

@@ -27,6 +27,8 @@ if os.environ.get("CLAUDE_INVOKED_BY"):
 
 TOOL_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = TOOL_ROOT / "scripts"
+sys.path.insert(0, str(SCRIPTS_DIR))
+from path_safety import managed_dir, validate_layout
 
 if (TOOL_ROOT / ".disabled-by-codex").exists() or os.environ.get("CMC_DISABLED") == "1":
     sys.exit(0)
@@ -53,7 +55,7 @@ def _config_int(name: str, default: int) -> int:
 
 def _load_project_config(project_dir: Path) -> dict:
     cfg_path = project_dir / ".cmc-config.json"
-    if not cfg_path.exists():
+    if cfg_path.is_symlink() or not cfg_path.is_file():
         return {}
     try:
         return json.loads(cfg_path.read_text(encoding="utf-8"))
@@ -73,10 +75,13 @@ MIN_TURNS_TO_FLUSH = int(_cfg.get("min_turns_to_flush_compact", _config_int("MIN
 
 
 def _setup_logging() -> None:
-    if not WIKI_DIR.exists():
+    if not managed_dir(PROJECT_DIR, "wiki").is_dir():
         logging.basicConfig(level=logging.WARNING)
         return
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    managed_dir(PROJECT_DIR, ".cmc", create=True)
+    if (STATE_DIR / "flush.log").is_symlink():
+        logging.basicConfig(level=logging.WARNING)
+        return
     logging.basicConfig(
         filename=str(STATE_DIR / "flush.log"),
         level=logging.INFO,
@@ -134,9 +139,13 @@ def extract_conversation_context(transcript_path: Path) -> tuple[str, int]:
 
 
 def main() -> None:
+    try:
+        validate_layout(PROJECT_DIR)
+    except ValueError:
+        return
     _setup_logging()
 
-    if not WIKI_DIR.exists():
+    if not managed_dir(PROJECT_DIR, "wiki").is_dir():
         return
 
     try:
@@ -160,7 +169,7 @@ def main() -> None:
         return
 
     transcript_path = Path(transcript_path_str)
-    if not transcript_path.exists():
+    if transcript_path.is_symlink() or not transcript_path.is_file():
         logging.info("SKIP: transcript missing: %s", transcript_path_str)
         return
 

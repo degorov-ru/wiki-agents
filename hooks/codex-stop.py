@@ -1,9 +1,9 @@
 """
-Codex Stop hook - capture the latest Codex session for this project.
+Codex Stop hook - capture the explicitly identified session for this project.
 
 Codex writes sessions as JSONL under ~/.codex/sessions. Unlike Claude Code,
 Codex Stop hooks do not hand us a Claude transcript path, so this adapter finds
-the newest Codex session whose session_meta.cwd matches the current project,
+the exact Codex session whose session_meta.cwd matches the current project,
 extracts the recent user/assistant messages, and reuses scripts/flush.py.
 """
 
@@ -20,6 +20,9 @@ from pathlib import Path
 
 TOOL_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = TOOL_ROOT / "scripts"
+sys.path.insert(0, str(SCRIPTS_DIR))
+from pending import project_lock, claim_flush, valid_session_id
+from path_safety import atomic_write_text, contained_file, managed_dir, validate_layout
 
 if (TOOL_ROOT / ".disabled-by-codex").exists() or os.environ.get("CMC_DISABLED") == "1":
     sys.exit(0)
@@ -59,7 +62,7 @@ HOOK_INPUT = _read_hook_input()
 
 def _load_project_config() -> dict:
     cfg_path = PROJECT_DIR / ".cmc-config.json"
-    if not cfg_path.exists():
+    if cfg_path.is_symlink() or not cfg_path.is_file():
         return {}
     try:
         return json.loads(cfg_path.read_text(encoding="utf-8"))
@@ -93,6 +96,9 @@ def _setup_logging() -> None:
         logging.basicConfig(level=logging.WARNING)
         return
     STATE_DIR.mkdir(parents=True, exist_ok=True)
+    if (STATE_DIR / "flush.log").is_symlink():
+        logging.basicConfig(level=logging.WARNING)
+        return
     logging.basicConfig(
         filename=str(STATE_DIR / "flush.log"),
         level=logging.INFO,
@@ -109,7 +115,17 @@ def _iter_session_files() -> list[Path]:
     sessions_dir = _codex_home() / "sessions"
     if not sessions_dir.exists():
         return []
-    return sorted(sessions_dir.rglob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return sorted((p for p in sessions_dir.rglob("*.jsonl") if _safe_session(p)),
+                  key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def _safe_session(path: Path) -> bool:
+    root = _codex_home() / "sessions"
+    try:
+        contained_file(path, root)
+    except ValueError:
+        return False
+    return True
 
 
 def _session_meta(path: Path) -> dict:
@@ -129,6 +145,7 @@ def _session_meta(path: Path) -> dict:
 
 
 def _find_latest_session() -> tuple[Path | None, str]:
+    explicit_id = HOOK_INPUT.get("session_id") or os.environ.get("CODEX_SESSION_ID")
     explicit_path = (
         HOOK_INPUT.get("session_path")
         or HOOK_INPUT.get("transcript_path")
@@ -137,30 +154,25 @@ def _find_latest_session() -> tuple[Path | None, str]:
     )
     if explicit_path:
         path = Path(str(explicit_path)).expanduser()
-        if path.exists():
+        if _safe_session(path):
             meta = _session_meta(path)
             cwd = meta.get("cwd")
             if cwd and str(Path(cwd).expanduser().resolve()) == str(PROJECT_DIR):
-                session_id = str(
-                    HOOK_INPUT.get("session_id")
-                    or os.environ.get("CODEX_SESSION_ID")
-                    or meta.get("id")
-                    or path.stem
-                )
-                return path, session_id
+                session_id = str(meta.get("id") or "")
+                if valid_session_id(session_id) and (not explicit_id or str(explicit_id) == session_id):
+                    return path, session_id
+        return None, "unknown"
 
-    explicit_id = HOOK_INPUT.get("session_id") or os.environ.get("CODEX_SESSION_ID")
+    if not explicit_id or not valid_session_id(str(explicit_id)):
+        return None, "unknown"
     project_str = str(PROJECT_DIR)
     for path in _iter_session_files():
         meta = _session_meta(path)
-        session_id = str(meta.get("id") or path.stem)
+        session_id = str(meta.get("id") or "")
         if explicit_id and session_id == str(explicit_id):
             cwd = meta.get("cwd")
             if cwd and str(Path(cwd).expanduser().resolve()) == project_str:
                 return path, session_id
-        cwd = meta.get("cwd")
-        if cwd and str(Path(cwd).expanduser().resolve()) == project_str:
-            return path, session_id
 
     return None, "unknown"
 
@@ -198,31 +210,46 @@ def _extract_text_from_message_payload(payload: dict) -> tuple[str | None, str |
     return None, None
 
 
-def extract_codex_context(session_path: Path) -> tuple[str, int]:
+def extract_codex_context_since(session_path: Path, offset: int = 0) -> tuple[str, int, int]:
+    """Extract only complete JSONL records appended after a byte offset."""
     turns: list[str] = []
-    seen: set[tuple[str, str]] = set()
+    previous: tuple[str, str] | None = None
+    size = session_path.stat().st_size
+    if not isinstance(offset, int) or offset < 0 or offset > size:
+        offset = 0
+    with session_path.open("rb") as f:
+        f.seek(offset)
+        data = f.read()
+    boundary = data.rfind(b"\n")
+    if boundary < 0:
+        return "", 0, offset
+    complete = data[:boundary + 1]
+    end_offset = offset + len(complete)
 
-    with session_path.open(encoding="utf-8") as f:
-        for line in f:
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+    for raw_line in complete.splitlines():
+        try:
+            line = raw_line.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
 
-            payload = entry.get("payload")
-            if not isinstance(payload, dict):
-                continue
+        payload = entry.get("payload")
+        if not isinstance(payload, dict):
+            continue
 
-            label, text = _extract_text_from_message_payload(payload)
-            if not label or not text:
-                continue
+        label, text = _extract_text_from_message_payload(payload)
+        if not label or not text:
+            continue
 
-            text = re.sub(r"\n{3,}", "\n\n", text).strip()
-            key = (label, text)
-            if key in seen:
-                continue
-            seen.add(key)
-            turns.append(f"**{label}:** {text}\n")
+        text = re.sub(r"\n{3,}", "\n\n", text).strip()
+        key = (label, text)
+        if key == previous:
+            continue
+        previous = key
+        turns.append(f"**{label}:** {text}\n")
 
     recent = turns[-MAX_TURNS:]
     context = "\n".join(recent)
@@ -233,7 +260,12 @@ def extract_codex_context(session_path: Path) -> tuple[str, int]:
         if boundary > 0:
             context = context[boundary + 1 :]
 
-    return context, len(recent)
+    return context, len(recent), end_offset
+
+
+def extract_codex_context(session_path: Path) -> tuple[str, int]:
+    context, count, _ = extract_codex_context_since(session_path)
+    return context, count
 
 
 def _load_state() -> dict:
@@ -247,7 +279,7 @@ def _load_state() -> dict:
 
 def _save_state(state: dict) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    CODEX_STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    atomic_write_text(CODEX_STATE_FILE, json.dumps(state, indent=2))
 
 
 def _spawn_flush(context_file: Path, session_id: str) -> None:
@@ -286,19 +318,28 @@ def _retry_failed_flush() -> bool:
                 continue
         except OSError:
             continue
-        try:
-            context_file.touch()
-        except OSError:
-            continue
-        _spawn_flush(context_file, "retry")
-        return True
+        with project_lock(PROJECT_DIR):
+            if claim_flush(context_file, "retry", PROJECT_DIR):
+                return True
     return False
 
 
 def main() -> int:
+    try:
+        validate_layout(PROJECT_DIR, create_state=False)
+    except ValueError:
+        return 0
     _setup_logging()
 
-    if not WIKI_DIR.exists():
+    if "--dry-run" in sys.argv:
+        session_path, session_id = _find_latest_session()
+        context, turn_count = extract_codex_context(session_path) if session_path else ("", 0)
+        print(json.dumps({"project_dir": str(PROJECT_DIR), "session_id": session_id,
+                          "session_path": str(session_path) if session_path else None,
+                          "turn_count": turn_count, "context_chars": len(context)}, indent=2))
+        return 0
+
+    if not managed_dir(PROJECT_DIR, "wiki").is_dir():
         logging.info("SKIP: memory not enabled for project %s (no wiki/ dir)", PROJECT_DIR)
         return 0
 
@@ -310,58 +351,61 @@ def main() -> int:
         logging.info("SKIP: no Codex session file found")
         return 0
 
+    with project_lock(PROJECT_DIR):
+        return _capture_session(session_path, session_id)
+
+
+def _capture_session(session_path: Path, session_id: str) -> int:
+    if (STATE_DIR / "purge-paused").exists():
+        return 0
     state = _load_state()
+    sessions = state.get("sessions", {})
+    if not isinstance(sessions, dict):
+        sessions = {}
+    prior = sessions.get(session_id, {})
+    if not isinstance(prior, dict) or prior.get("session_path") != str(session_path):
+        prior = {}
     session_mtime = session_path.stat().st_mtime
     if (
-        state.get("session_path") == str(session_path)
-        and float(state.get("session_mtime", 0)) >= session_mtime
+        prior.get("session_path") == str(session_path)
+        and float(prior.get("session_mtime", 0)) >= session_mtime
     ):
         logging.info("SKIP: Codex session already flushed: %s", session_path)
         return 0
 
-    context, turn_count = extract_codex_context(session_path)
+    offset = prior.get("session_offset", 0)
+    context, turn_count, end_offset = extract_codex_context_since(session_path, offset)
+    next_state = {
+        "session_path": str(session_path),
+        "session_offset": end_offset,
+        "session_mtime": session_mtime,
+        "flushed_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+    }
+    sessions[session_id] = next_state
+    state = {"sessions": dict(sorted(
+        sessions.items(), key=lambda item: str(item[1].get("flushed_at", "")), reverse=True
+    )[:50])}
     if not context.strip():
+        _save_state(state)
         logging.info("SKIP: empty Codex context from %s", session_path)
         return 0
     if turn_count < MIN_TURNS_TO_FLUSH:
+        # Keep the previous cursor so the next Stop can batch this short delta.
         logging.info("SKIP: only %d turns (min %d)", turn_count, MIN_TURNS_TO_FLUSH)
         return 0
 
-    if "--dry-run" in sys.argv:
-        print(
-            json.dumps(
-                {
-                    "project_dir": str(PROJECT_DIR),
-                    "session_id": session_id,
-                    "session_path": str(session_path),
-                    "turn_count": turn_count,
-                    "context_chars": len(context),
-                },
-                indent=2,
-            )
-        )
-        return 0
-
-    timestamp = datetime.now(timezone.utc).astimezone().strftime("%Y%m%d-%H%M%S")
+    timestamp = datetime.now(timezone.utc).astimezone().strftime("%Y%m%d-%H%M%S-%f")
     context_file = STATE_DIR / f"codex-flush-{session_id}-{timestamp}.md"
     context_file.write_text(context, encoding="utf-8")
+    _save_state(state)
 
     try:
-        _spawn_flush(context_file, session_id)
+        claimed = claim_flush(context_file, session_id, PROJECT_DIR)
     except Exception as e:
         logging.error("Failed to spawn flush.py for Codex session %s: %s", session_id, e)
-        context_file.unlink(missing_ok=True)
         return 0
-
-    _save_state(
-        {
-            "session_id": session_id,
-            "session_path": str(session_path),
-            "session_mtime": session_mtime,
-            "flushed_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
-        }
-    )
-    logging.info("Spawned flush.py for Codex session %s (%d turns)", session_id, turn_count)
+    logging.info("%s flush.py for Codex session %s (%d turns)",
+                 "Spawned" if claimed else "Retained", session_id, turn_count)
     return 0
 
 

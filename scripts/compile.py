@@ -15,9 +15,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import sys
+from time import time
 from pathlib import Path
 
 TOOL_ROOT = Path(__file__).resolve().parent.parent
@@ -33,21 +35,28 @@ from config import (
     DAILY_DIR,
     KNOWLEDGE_DIR,
     PROJECT_DIR,
+    SOURCES_DIR,
     ensure_state_dir,
     now_iso,
 )
 from utils import (
     file_hash,
     list_raw_files,
+    list_source_files,
     list_wiki_articles,
     load_state,
     read_wiki_index,
+    safe_regular_file,
+    safe_root,
     save_state,
 )
+from memory_contract import apply_proposal, parse_proposal, redact_sensitive, recover_pending_commit
+from init_project import AGENTS_TEMPLATE
+from path_safety import append_text
 
 ensure_state_dir()
 
-# Grok needs the project CWD so Read/Write tools resolve inside its wiki.
+# Provider reads project context; code owns all writes.
 ROOT_DIR = PROJECT_DIR
 
 # A long daily log is split into chunks compiled by separate agent runs, so no
@@ -58,21 +67,31 @@ CHUNK_CHARS = int(os.environ.get("CMC_CHUNK_CHARS", "40000"))
 
 MAX_TURNS = int(os.environ.get("CMC_MAX_TURNS", "30"))
 
-SYSTEM_PROMPT = (
-    "You are a knowledge compiler. Read a daily conversation log and extract "
-    "knowledge into structured wiki articles using the Read/Write/Edit/Glob/"
-    "Grep tools. Follow the task instructions exactly. Be concise; do not "
-    "narrate."
-)
+SYSTEM_PROMPT = "You are a knowledge compiler. Read only. Return JSON only."
 
 
-# Every chunk re-sends the whole wiki so the agent knows what already exists
-# and updates instead of duplicating. That context grows with the wiki and
-# eventually dwarfs the log itself, and it is re-read on every agent turn.
-# Past this many characters we send an index (path + one-line summary) instead
-# of full article bodies and let the agent Read the few it actually needs —
-# it already has the Read/Grep tools. Set 0 to always inline everything.
+# Every chunk gets bounded existing-wiki context from code. Models receive no
+# filesystem tools; past this size the context becomes a truncated summary list.
 WIKI_CTX_MAX_CHARS = int(os.environ.get("CMC_WIKI_CTX_MAX_CHARS", "60000"))
+COMPILE_LOCK_STALE_SECONDS = 6 * 60 * 60
+
+
+def _claim_compile_lock() -> bool:
+    lock_path = PROJECT_DIR / ".cmc" / "compile.lock"
+    inherited = os.environ.get("CMC_COMPILE_LOCK")
+    if inherited and Path(inherited).resolve() == lock_path.resolve() and lock_path.is_file():
+        return True
+    if lock_path.exists() and time() - lock_path.stat().st_mtime >= COMPILE_LOCK_STALE_SECONDS:
+        lock_path.unlink(missing_ok=True)
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        print("Compile already running; leaving daily logs pending.")
+        return False
+    with os.fdopen(fd, "w", encoding="utf-8") as lock:
+        lock.write(f"pid={os.getpid()}\n")
+    os.environ["CMC_COMPILE_LOCK"] = str(lock_path)
+    return True
 
 
 def _article_summary(content: str, limit: int = 120) -> str:
@@ -125,12 +144,11 @@ def _build_wiki_context(existing: dict) -> tuple[str, str]:
         f"The wiki already contains {len(existing)} articles. They are listed "
         "below by path and summary rather than inlined in full.\n\n"
         "**Before you create an article, check this list.** If the concept is "
-        "already here, open that file with the Read tool and update it instead "
-        "of creating a duplicate. Use Read/Grep to inspect any article you need "
-        "to link to or extend.\n\n"
+        "already here, update it through the returned proposal instead of "
+        "creating a duplicate.\n\n"
         f"{listing}"
     )
-    return text, "index"
+    return text[:WIKI_CTX_MAX_CHARS], "index" if len(text) <= WIKI_CTX_MAX_CHARS else "index-truncated"
 
 
 def _append_run(record: dict) -> None:
@@ -139,8 +157,7 @@ def _append_run(record: dict) -> None:
     try:
         ensure_state_dir()
         record = {"ts": now_iso(), **record}
-        with open(COMPILE_RUNS_FILE, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        append_text(COMPILE_RUNS_FILE, json.dumps(record, ensure_ascii=False) + "\n")
     except Exception:
         pass
 
@@ -171,7 +188,7 @@ def split_log(text: str, max_chars: int) -> list[str]:
     return chunks or [text]
 
 
-def _build_prompt(log_path, chunk_text, part_note, schema, wiki_index,
+def _build_prompt(log_path, source_rel, chunk_text, part_note, schema, wiki_index,
                   existing_articles_context, timestamp):
     return f"""You are a knowledge compiler. Your job is to read a daily conversation log
 and extract knowledge into structured wiki articles.
@@ -188,53 +205,57 @@ and extract knowledge into structured wiki articles.
 
 {existing_articles_context if existing_articles_context else "(No existing articles yet)"}
 
-## Daily Log to Compile
+## Source Material to Compile
 
-**File:** {log_path.name}{part_note}
+**File:** {source_rel}{part_note}
 
 {chunk_text}
 
 ## Your Task
 
-Read the daily log above and compile it into wiki articles following the schema exactly.
+Read the daily log above. Return exactly one JSON object. Either
+`{{"result":"noop","reason":"...","changes":[]}}` or
+`{{"result":"changes","changes":[{{"path":"wiki/concepts/name.md","content":"..."}}]}}`.
+Code, not you, writes files. Paths may only be wiki/index.md, wiki/log.md or a markdown
+file under wiki/concepts, wiki/connections or wiki/qa.
 
 ### Rules:
 
-1. **Extract key concepts** - Identify 3-7 distinct concepts worth their own article
-2. **Create concept articles** in `wiki/concepts/` - One .md file per concept
+1. Extract only durable knowledge. Zero articles is valid.
+2. Propose concept articles in `wiki/concepts/` - One .md file per concept
    - Use the exact article format from AGENTS.md (YAML frontmatter + sections)
-   - Include `sources:` in frontmatter pointing to the daily log file
+   - Include `sources:` in frontmatter pointing exactly to `{source_rel}`
    - Use `[[concepts/slug]]` wikilinks to link to related concepts
    - Write in encyclopedia style - neutral, comprehensive
-3. **Create connection articles** in `wiki/connections/` if this log reveals non-obvious
+3. Propose connection articles in `wiki/connections/` if this log reveals non-obvious
    relationships between 2+ existing concepts
 4. **Update existing articles** if this log adds new information to concepts already in the wiki
    - Read the existing article, add the new information, add the source to frontmatter
    - If a concept in this part already has an article (see Existing Wiki Articles above),
      UPDATE it instead of creating a duplicate
-5. **Update wiki/index.md** - Add new entries to the table
+5. Propose an update to wiki/index.md - Add new entries to the table
    - Each entry: `| [[path/slug]] | One-line summary | source-file | {timestamp[:10]} |`
-6. **Append to wiki/log.md** - Add a timestamped entry:
+6. Propose an append to wiki/log.md - Add a timestamped entry:
    ```
-   ## [{timestamp}] compile | {log_path.name}
-   - Source: daily/{log_path.name}
+   ## [{timestamp}] compile | {source_rel}
+   - Source: {source_rel}
    - Articles created: [[concepts/x]], [[concepts/y]]
    - Articles updated: [[concepts/z]] (if any)
    ```
 
-### File paths:
-- Write concept articles to: {CONCEPTS_DIR}
-- Write connection articles to: {CONNECTIONS_DIR}
-- Update index at: {KNOWLEDGE_DIR / 'index.md'}
-- Append log at: {KNOWLEDGE_DIR / 'log.md'}
+### Managed file paths:
+- concepts: wiki/concepts/
+- connections: wiki/connections/
+- index: wiki/index.md
+- log: wiki/log.md
 
 ### Quality standards:
-- Every article must have complete YAML frontmatter
-- Every article must link to at least 2 other articles via [[wikilinks]]
-- Key Points section should have 3-5 bullet points
-- Details section should have 2+ paragraphs
-- Related Concepts section should have 2+ entries
-- Sources section should cite the daily log with specific claims extracted
+- Every article has title, kind, status, updated and sources frontmatter.
+- kind is fact, decision, procedure, hypothesis or preference; status is proposed,
+  active, disputed, superseded or cancelled. Use superseded only when a
+  `superseded_by` wikilink names the replacement; use cancelled when no
+  replacement exists. Cite precise daily anchors when available.
+- Keep articles short when that is sufficient. No backlink or word-count quotas.
 """
 
 
@@ -248,15 +269,44 @@ async def compile_daily_log(log_path: Path, state: dict) -> float:
 
     Returns the total API cost of the compilation.
     """
-    log_content = log_path.read_text(encoding="utf-8")
-    schema = AGENTS_FILE.read_text(encoding="utf-8")
+    if (PROJECT_DIR / ".cmc" / "purge-paused").exists():
+        raise RuntimeError("memory is paused for controlled purge")
+    safe_log = safe_regular_file(log_path, DAILY_DIR)
+    source_rel = f"daily/{log_path.name}"
+    if safe_log is None:
+        safe_log = safe_regular_file(log_path, SOURCES_DIR)
+        source_rel = f"sources/{log_path.name}"
+    if safe_log is None:
+        raise ValueError("input must be a regular file inside daily/ or sources/")
+    log_path = safe_log
+    snapshot = log_path.read_bytes()
+    snapshot_hash = hashlib.sha256(snapshot).hexdigest()[:16]
+    log_content = snapshot.decode("utf-8")
+    rel_path = log_path.name if source_rel.startswith("daily/") else source_rel
 
-    chunks = split_log(log_content, CHUNK_CHARS)
+    def record_failure(stage: str, error: object) -> None:
+        failed_at = now_iso()
+        state.setdefault("ingested", {})[rel_path] = {
+            "hash": snapshot_hash, "failed_at": failed_at,
+            "stage": stage, "error": str(error)[:500],
+        }
+        state["last_failure"] = {"stage": stage, "at": failed_at,
+                                 "source": rel_path, "error": str(error)[:500]}
+        save_state(state)
+    schema_path = safe_regular_file(AGENTS_FILE, PROJECT_DIR)
+    if schema_path is None:
+        raise ValueError("AGENTS input escapes the project and product roots")
+    schema = AGENTS_TEMPLATE + "\n\n## Project-specific agent rules\n\n" + schema_path.read_text(encoding="utf-8")
+
+    # One proposal keeps publication atomic. Provider context limits are safer
+    # than publishing half of a multi-chunk source.
+    chunks = [log_content]
     n = len(chunks)
     if n > 1:
         print(f"  Log is large ({len(log_content)} chars) - splitting into {n} chunks.")
 
     total_cost = 0.0
+    all_costs_known = True
 
     for i, chunk_text in enumerate(chunks, 1):
         # Re-read wiki state each chunk so later chunks see earlier output.
@@ -269,11 +319,6 @@ async def compile_daily_log(log_path: Path, state: dict) -> float:
 
         part_note = f" (part {i} of {n})" if n > 1 else ""
         timestamp = now_iso()
-        prompt = _build_prompt(
-            log_path, chunk_text, part_note, schema, wiki_index,
-            existing_articles_context, timestamp,
-        )
-
         if n > 1:
             print(f"  Chunk {i}/{n} ({len(chunk_text)} chars)...")
 
@@ -288,38 +333,64 @@ async def compile_daily_log(log_path: Path, state: dict) -> float:
 
         from model_client import run_text_prompt
 
+        safe_chunk, chunk_redacted = redact_sensitive(chunk_text)
+        prompt = _build_prompt(
+            log_path, source_rel, safe_chunk, part_note, schema, wiki_index,
+            existing_articles_context, timestamp,
+        )
+        safe_prompt, prompt_redacted = redact_sensitive(SYSTEM_PROMPT + "\n\n" + prompt)
+        redacted = chunk_redacted or prompt_redacted
         result = run_text_prompt(
-            SYSTEM_PROMPT + "\n\n" + prompt,
+            safe_prompt,
             ROOT_DIR,
             max_turns=MAX_TURNS,
-            tools=("Read", "Write", "Edit", "Glob", "Grep"),
+            tools=(),
         )
         _append_run({**chunk_meta, **result, "fallback": bool(result.get("fallback_from")),
                      "deferred": not result.get("ok")})
-        cost = result.get("cost_usd") or 0.0
+        cost_known = result.get("cost_known") is True or isinstance(result.get("cost_usd"), (int, float))
+        cost = result.get("cost_usd") if cost_known else 0.0
+        all_costs_known = all_costs_known and cost_known
         if not result.get("ok"):
             print(f"  [{result.get('engine', 'engine')}] FAIL: {result.get('error')} - leaving log pending")
+            record_failure("provider", result.get("error") or "unknown")
             state["total_cost"] = state.get("total_cost", 0.0) + total_cost
-            save_state(state)
+            return total_cost
+        try:
+            proposal = parse_proposal(str(result.get("text") or ""))
+            if file_hash(log_path) != snapshot_hash:
+                print("  Daily changed during compile - leaving it pending")
+                record_failure("source_changed", "source changed during compile")
+                return total_cost
+            changed = apply_proposal(PROJECT_DIR, proposal)
+        except ValueError as exc:
+            result = {**result, "ok": False, "error": str(exc)}
+            _append_run({**chunk_meta, **result, "deferred": True})
+            record_failure("proposal", exc)
+            return total_cost
+        if file_hash(log_path) != snapshot_hash:
+            print("  Daily changed while applying changes - leaving it pending")
+            record_failure("source_changed", "source changed while applying changes")
             return total_cost
         total_cost += cost
-        print(f"  [{result['engine']}] ok  cost≈${cost:.4f}  {result.get('total_tokens') or ''}")
+        cost_label = f"${cost:.4f}" if cost_known else "unknown"
+        print(f"  [{result['engine']}] ok  cost={cost_label}  {result.get('total_tokens') or ''}")
 
     # Update state
-    rel_path = log_path.name
     state.setdefault("ingested", {})[rel_path] = {
-        "hash": file_hash(log_path),
+        "hash": snapshot_hash,
         "compiled_at": now_iso(),
-        "cost_usd": total_cost,
-        "chunks": n,
+        "cost_usd": total_cost if all_costs_known else None,
+        "chunks": n, "changes": changed, "redacted": redacted,
     }
     state["total_cost"] = state.get("total_cost", 0.0) + total_cost
+    state["last_success"] = {"stage": "compile", "at": now_iso(), "source": rel_path}
     save_state(state)
 
     return total_cost
 
 
-def main():
+def main() -> int:
     parser = argparse.ArgumentParser(description="Compile daily logs into knowledge articles")
     parser.add_argument("--all", action="store_true", help="Force recompile all logs")
     parser.add_argument("--file", type=str, help="Compile a specific daily log file")
@@ -332,7 +403,7 @@ def main():
     if args.file:
         target = Path(args.file)
         if not target.is_absolute():
-            target = DAILY_DIR / target.name
+            target = ROOT_DIR / target if len(target.parts) > 1 else DAILY_DIR / target.name
         if not target.exists():
             # Try resolving relative to project root
             target = ROOT_DIR / args.file
@@ -341,13 +412,13 @@ def main():
             sys.exit(1)
         to_compile = [target]
     else:
-        all_logs = list_raw_files()
+        all_logs = list_raw_files() + list_source_files()
         if args.all:
             to_compile = all_logs
         else:
             to_compile = []
             for log_path in all_logs:
-                rel = log_path.name
+                rel = log_path.name if log_path.parent == DAILY_DIR else f"sources/{log_path.name}"
                 prev = state.get("ingested", {}).get(rel, {})
                 # Recompile if never seen, changed, or last attempt failed
                 # (failure retry pacing is handled by maybe_compile.py).
@@ -356,32 +427,43 @@ def main():
 
     if not to_compile:
         print("Nothing to compile - all daily logs are up to date.")
-        return
+        return 0
 
     print(f"{'[DRY RUN] ' if args.dry_run else ''}Files to compile ({len(to_compile)}):")
     for f in to_compile:
         print(f"  - {f.name}")
 
     if args.dry_run:
-        return
+        return 0
+
+    if not _claim_compile_lock():
+        return 0
 
     try:
         # Compile each file sequentially
         total_cost = 0.0
+        unknown_cost = False
+        failed = False
         for i, log_path in enumerate(to_compile, 1):
             print(f"\n[{i}/{len(to_compile)}] Compiling {log_path.name}...")
             cost = asyncio.run(compile_daily_log(log_path, state))
             total_cost += cost
-            print(f"  Done.")
+            rel = log_path.name if log_path.parent == DAILY_DIR else f"sources/{log_path.name}"
+            entry = state.get("ingested", {}).get(rel, {})
+            failed = failed or bool(entry.get("failed_at"))
+            unknown_cost = unknown_cost or entry.get("cost_usd") is None
+            print("  Failed; left pending." if entry.get("failed_at") else "  Done.")
 
         articles = list_wiki_articles()
-        print(f"\nCompilation complete. Total cost: ${total_cost:.2f}")
+        print(f"\nCompilation complete. Reported cost: {'unknown' if unknown_cost else f'${total_cost:.2f}'}")
         print(f"Knowledge base: {len(articles)} articles")
+        return 1 if failed else 0
     finally:
         lock_path = os.environ.get("CMC_COMPILE_LOCK")
-        if lock_path:
-            Path(lock_path).unlink(missing_ok=True)
+        expected_lock = PROJECT_DIR / ".cmc" / "compile.lock"
+        if lock_path and Path(lock_path).resolve() == expected_lock.resolve():
+            expected_lock.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

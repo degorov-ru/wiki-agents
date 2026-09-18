@@ -38,6 +38,18 @@ class BackfillTests(unittest.TestCase):
             self.assertEqual(2, len(turns))
             self.assertNotIn("secret output", "\n".join(turns))
 
+    def test_nonconsecutive_repeat_is_preserved_and_session_id_is_strict(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "session.jsonl"
+            records = [
+                {"payload": {"type": "user_message", "message": "same"}},
+                {"payload": {"type": "agent_message", "message": "between"}},
+                {"payload": {"type": "user_message", "message": "same"}},
+            ]
+            path.write_text("\n".join(json.dumps(item) for item in records), encoding="utf-8")
+            self.assertEqual(3, len(backfill.session_turns(path)))
+        self.assertFalse(backfill.valid_session_id("../../outside"))
+
 
 if __name__ == "__main__":
     unittest.main()

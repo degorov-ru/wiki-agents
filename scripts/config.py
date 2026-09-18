@@ -137,8 +137,13 @@ def memory_enabled() -> bool:
     hooks are safe to leave installed even when working in throw-away
     directories.
     """
-    return WIKI_DIR.exists()
+    from path_safety import managed_dir
+    try:
+        return managed_dir(PROJECT_DIR, "wiki").is_dir()
+    except ValueError:
+        return False
 
 
 def ensure_state_dir() -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    from path_safety import validate_layout
+    validate_layout(PROJECT_DIR, create_state=True)

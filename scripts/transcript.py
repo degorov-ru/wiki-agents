@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from path_safety import atomic_write_text
 
 
 def _turn_from_entry(entry: dict) -> str | None:
@@ -110,6 +111,4 @@ def save_offset(state_file: Path, transcript_path: str, offset: int, session_id:
         for key in list(data.keys())[:-200]:
             del data[key]
     state_file.parent.mkdir(parents=True, exist_ok=True)
-    tmp = state_file.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data), encoding="utf-8")
-    tmp.replace(state_file)
+    atomic_write_text(state_file, json.dumps(data))

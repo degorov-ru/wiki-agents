@@ -32,6 +32,8 @@ if (TOOL_ROOT / ".disabled-by-codex").exists() or os.environ.get("CMC_DISABLED")
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
+from path_safety import managed_dir, validate_layout
+
 
 def _discover_project_dir() -> Path:
     val = os.environ.get("CLAUDE_PROJECT_DIR")
@@ -44,7 +46,11 @@ def _discover_project_dir() -> Path:
 
 def main() -> int:
     project_dir = _discover_project_dir()
-    if not (project_dir / "wiki").exists():
+    try:
+        validate_layout(project_dir)
+    except ValueError:
+        return 0
+    if not managed_dir(project_dir, "wiki").is_dir():
         return 0  # memory is opt-in
 
     try:
@@ -64,8 +70,9 @@ def main() -> int:
     if not Path(transcript_str).exists():
         return 0
 
-    state_dir = project_dir / ".cmc"
-    state_dir.mkdir(parents=True, exist_ok=True)
+    state_dir = managed_dir(project_dir, ".cmc", create=True)
+    if (state_dir / "flush.log").is_symlink():
+        return 0
     logging.basicConfig(
         filename=str(state_dir / "flush.log"),
         level=logging.INFO,

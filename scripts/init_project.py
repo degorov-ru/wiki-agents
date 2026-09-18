@@ -18,7 +18,6 @@ Creates (idempotently):
     <project>/AGENTS.md    (single source of agent rules — only if absent)
     <project>/CLAUDE.md    (pointer to AGENTS.md — only if absent)
     <project>/.codex/hooks.json  (Codex Stop hook — merged if present)
-    <project>/.obsidian/   (minimal vault settings — only if absent)
     <project>/.cmc-config.json  (token-budget knobs — only if absent)
     <project>/.gitignore   (adds .cmc/ entry if missing)
 
@@ -28,9 +27,12 @@ If ai-memory/ already exists, prefers to defer to migrate_ai_memory.py.
 from __future__ import annotations
 
 import json
+import shlex
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+
+from path_safety import validate_layout
 
 
 DEFAULT_CONFIG = {
@@ -79,8 +81,8 @@ This file is the single source of truth for coding agents and the memory compile
 ## Goal
 
 Maintain continuity between chats and agents. Each project owns its own memory:
-raw sources, daily conversation logs, compiled wiki articles, and Obsidian vault
-metadata all live inside the project directory.
+raw sources, daily conversation logs, and compiled Markdown wiki articles all
+live inside the project directory.
 
 ## Agent startup
 
@@ -134,6 +136,8 @@ Every article in `wiki/concepts/*.md` should have YAML frontmatter:
 ```yaml
 ---
 title: Short Title
+kind: decision
+status: active
 created: YYYY-MM-DD
 updated: YYYY-MM-DD
 sources:
@@ -191,106 +195,40 @@ Read `AGENTS.md` in this project before doing substantial work.
 - how Claude Code hooks, Codex, and the compiler share continuity.
 """
 
-OBSIDIAN_FILES = {
-    "app.json": "{}",
-    "appearance.json": "{}",
-    "community-plugins.json": "[]",
-    "core-plugins.json": json.dumps(
-        {
-            "file-explorer": True,
-            "global-search": True,
-            "switcher": True,
-            "graph": True,
-            "backlink": True,
-            "canvas": True,
-            "outgoing-link": True,
-            "tag-pane": True,
-            "properties": True,
-            "page-preview": True,
-            "daily-notes": True,
-            "templates": True,
-            "note-composer": True,
-            "command-palette": True,
-            "editor-status": True,
-            "bookmarks": True,
-            "outline": True,
-            "word-count": True,
-            "file-recovery": True,
-        },
-        indent=2,
-    ),
-    "graph.json": json.dumps(
-        {
-            "collapse-filter": True,
-            "search": "",
-            "showTags": False,
-            "showAttachments": False,
-            "hideUnresolved": False,
-            "showOrphans": True,
-            "collapse-color-groups": True,
-            "colorGroups": [],
-            "collapse-display": True,
-            "showArrow": False,
-            "textFadeMultiplier": 0,
-            "nodeSizeMultiplier": 1,
-            "lineSizeMultiplier": 1,
-            "collapse-forces": True,
-            "centerStrength": 0.518713248970312,
-            "repelStrength": 10,
-            "linkStrength": 1,
-            "linkDistance": 250,
-            "scale": 1,
-            "close": False,
-        },
-        indent=2,
-    ),
-    "workspace.json": json.dumps(
-        {
-            "main": {
-                "id": "memory-main",
-                "type": "split",
-                "children": [
-                    {
-                        "id": "memory-tabs",
-                        "type": "tabs",
-                        "children": [
-                            {
-                                "id": "memory-index",
-                                "type": "leaf",
-                                "state": {
-                                    "type": "markdown",
-                                    "state": {"file": "wiki/index.md", "mode": "source"},
-                                    "icon": "lucide-file",
-                                    "title": "index",
-                                },
-                            }
-                        ],
-                    }
-                ],
-                "direction": "vertical",
-            },
-            "left": {
-                "id": "memory-left",
-                "type": "split",
-                "children": [],
-                "direction": "horizontal",
-                "width": 300,
-            },
-            "right": {
-                "id": "memory-right",
-                "type": "split",
-                "children": [],
-                "direction": "horizontal",
-                "width": 300,
-                "collapsed": True,
-            },
-            "active": "memory-index",
-        },
-        indent=2,
-    ),
-}
+GITIGNORE_ENTRIES = [".cmc/", "daily/", "sources/", "wiki/", "ACCESS.md", ".cmc-config.json"]
+AGENTS_BLOCK_START = "<!-- wiki-agents:memory-start -->"
+AGENTS_BLOCK_END = "<!-- wiki-agents:memory-end -->"
+AGENTS_BLOCK = f"""{AGENTS_BLOCK_START}
+## Project memory
 
-GITIGNORE_ENTRIES = [".cmc/", "daily/", "sources/"]
+Before substantial work, read `wiki/index.md`, the latest file in `daily/`,
+and relevant pages under `wiki/`. Keep stable facts traceable to `daily/` or
+`sources/`; never store credentials in project memory. Also read project-local
+`CLAUDE.md` and `AGENT_GUIDE.md` when present: rules outside their managed
+pointer blocks remain authoritative.
+{AGENTS_BLOCK_END}
+"""
+POINTER_BLOCK_START = "<!-- wiki-agents:pointer-start -->"
+POINTER_BLOCK_END = "<!-- wiki-agents:pointer-end -->"
+POINTER_BLOCK = f"""{POINTER_BLOCK_START}
+`AGENTS.md` is the canonical project guide. Read it before substantial work.
+Keep and follow any project-specific rules outside this managed block; if this
+file is `AGENT_GUIDE.md`, treat those rules as legacy until merged into AGENTS.
+{POINTER_BLOCK_END}
+"""
+
+
+def _preflight(project_dir: Path) -> None:
+    validate_layout(project_dir)
+    for path in (
+        project_dir / "wiki/concepts", project_dir / "wiki/connections",
+        project_dir / "wiki/qa", project_dir / ".gitignore",
+        project_dir / "ACCESS.md", project_dir / "AGENTS.md",
+        project_dir / "CLAUDE.md", project_dir / "AGENT_GUIDE.md",
+        project_dir / ".cmc-config.json", project_dir / ".codex/hooks.json",
+    ):
+        if path.is_symlink():
+            raise ValueError(f"initializer refuses symlinked path: {path.relative_to(project_dir)}")
 
 
 def _ensure(path: Path, content: str) -> bool:
@@ -311,7 +249,8 @@ def _ensure_dir(path: Path) -> bool:
 def _update_gitignore(project_dir: Path) -> bool:
     gi = project_dir / ".gitignore"
     existing = gi.read_text(encoding="utf-8") if gi.exists() else ""
-    new_lines = [e for e in GITIGNORE_ENTRIES if e not in existing]
+    rules = {line.strip() for line in existing.splitlines() if line.strip() and not line.lstrip().startswith("#")}
+    new_lines = [e for e in GITIGNORE_ENTRIES if e not in rules]
     if not new_lines:
         return False
     block = "\n# claude-memory-compiler\n" + "\n".join(new_lines) + "\n"
@@ -321,8 +260,32 @@ def _update_gitignore(project_dir: Path) -> bool:
     return True
 
 
+def _update_agents(project_dir: Path) -> bool:
+    path = project_dir / "AGENTS.md"
+    if not path.exists():
+        return _ensure(path, AGENTS_TEMPLATE.rstrip() + "\n\n" + AGENTS_BLOCK + "\n")
+    existing = path.read_text(encoding="utf-8")
+    if AGENTS_BLOCK_START in existing:
+        return False
+    separator = "" if not existing or existing.endswith("\n\n") else "\n" if existing.endswith("\n") else "\n\n"
+    path.write_text(existing + separator + AGENTS_BLOCK + "\n", encoding="utf-8")
+    return True
+
+
+def _update_pointer(path: Path, *, create: bool) -> bool:
+    if not path.exists():
+        return _ensure(path, CLAUDE_POINTER_TEMPLATE) if create else False
+    existing = path.read_text(encoding="utf-8")
+    if POINTER_BLOCK_START in existing or "Read `AGENTS.md` in this project" in existing:
+        return False
+    separator = "" if not existing or existing.endswith("\n\n") else "\n" if existing.endswith("\n") else "\n\n"
+    path.write_text(existing + separator + POINTER_BLOCK + "\n", encoding="utf-8")
+    return True
+
+
 def _codex_stop_command() -> str:
-    return f"uv run --directory {json.dumps(str(Path(__file__).resolve().parent.parent))} python hooks/codex-stop.py"
+    root = shlex.quote(str(Path(__file__).resolve().parent.parent))
+    return f"uv run --directory {root} python hooks/codex-stop.py"
 
 
 def _update_codex_hooks(project_dir: Path) -> bool:
@@ -333,8 +296,10 @@ def _update_codex_hooks(project_dir: Path) -> bool:
     if hooks_path.exists():
         try:
             data = json.loads(hooks_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            data = {}
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Refusing to overwrite invalid JSON: {hooks_path}") from exc
+        except OSError as exc:
+            raise RuntimeError(f"Cannot read hooks file: {hooks_path}") from exc
     else:
         data = {}
 
@@ -344,14 +309,21 @@ def _update_codex_hooks(project_dir: Path) -> bool:
         stop_entries = []
         hooks["Stop"] = stop_entries
 
+    before = json.dumps(data, sort_keys=True)
+    kept = []
     for entry in stop_entries:
         if not isinstance(entry, dict):
+            kept.append(entry)
             continue
-        for hook in entry.get("hooks", []):
-            if isinstance(hook, dict) and hook.get("command") == command:
-                return False
-
-    stop_entries.append(
+        remaining = [hook for hook in entry.get("hooks", []) if not (
+            isinstance(hook, dict) and "hooks/codex-stop.py" in str(hook.get("command", ""))
+        )]
+        if remaining:
+            entry = dict(entry)
+            entry["hooks"] = remaining
+            kept.append(entry)
+    hooks["Stop"] = kept
+    hooks["Stop"].append(
         {
             "hooks": [
                 {
@@ -361,6 +333,8 @@ def _update_codex_hooks(project_dir: Path) -> bool:
             ]
         }
     )
+    if json.dumps(data, sort_keys=True) == before:
+        return False
 
     hooks_path.parent.mkdir(parents=True, exist_ok=True)
     hooks_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
@@ -371,10 +345,13 @@ def init(project_dir: Path) -> dict:
     project_dir = project_dir.expanduser().resolve()
     if not project_dir.is_dir():
         raise SystemExit(f"Not a directory: {project_dir}")
+    _preflight(project_dir)
 
     created: list[str] = []
 
     # If there's a legacy ai-memory/, gently nudge to migrate first.
+    if (project_dir / "ai-memory").is_symlink():
+        raise ValueError("initializer refuses symlinked ai-memory")
     if (project_dir / "ai-memory").is_dir() and not (project_dir / "wiki").exists():
         return {
             "status": "needs_migration",
@@ -403,25 +380,28 @@ def init(project_dir: Path) -> dict:
     if _ensure(project_dir / "ACCESS.md", ACCESS_TEMPLATE):
         created.append("ACCESS.md")
 
-    if _ensure(project_dir / "AGENTS.md", AGENTS_TEMPLATE):
-        created.append("AGENTS.md")
-    if _ensure(project_dir / "CLAUDE.md", CLAUDE_POINTER_TEMPLATE):
-        created.append("CLAUDE.md")
+    if _update_agents(project_dir):
+        created.append("AGENTS.md (created or updated)")
+    if _update_pointer(project_dir / "CLAUDE.md", create=True):
+        created.append("CLAUDE.md (created or updated)")
+    if _update_pointer(project_dir / "AGENT_GUIDE.md", create=False):
+        created.append("AGENT_GUIDE.md (updated)")
 
     if _update_codex_hooks(project_dir):
         created.append(".codex/hooks.json (updated)")
-
-    obsidian_dir = project_dir / ".obsidian"
-    if _ensure_dir(obsidian_dir):
-        created.append(".obsidian/")
-    for filename, content in OBSIDIAN_FILES.items():
-        if _ensure(obsidian_dir / filename, content + "\n"):
-            created.append(f".obsidian/{filename}")
 
     config_path = project_dir / ".cmc-config.json"
     if not config_path.exists():
         config_path.write_text(json.dumps(DEFAULT_CONFIG, indent=2), encoding="utf-8")
         created.append(".cmc-config.json")
+
+    version_path = project_dir / ".cmc" / "version.json"
+    if not version_path.exists():
+        version_path.write_text(
+            json.dumps({"product_version": "0.2.2", "schema_version": 1}, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        created.append(".cmc/version.json")
 
     if _update_gitignore(project_dir):
         created.append(".gitignore (updated)")

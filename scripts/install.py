@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import shutil
+import shlex
 import sys
 from pathlib import Path
 
@@ -28,10 +29,12 @@ ENGINE_FIXES = {
 
 
 def _command(script: str) -> str:
-    return f"uv run --directory {json.dumps(str(TOOL_ROOT))} python hooks/{script}"
+    return f"uv run --directory {shlex.quote(str(TOOL_ROOT))} python hooks/{shlex.quote(script)}"
 
 
 def install_claude_hooks(settings_path: Path) -> None:
+    if settings_path.is_symlink():
+        raise RuntimeError(f"Refusing symlinked Claude settings: {settings_path}")
     try:
         data = json.loads(settings_path.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -46,12 +49,20 @@ def install_claude_hooks(settings_path: Path) -> None:
     for event, (script, timeout) in HOOKS.items():
         entries = hooks.setdefault(event, [])
         command = _command(script)
-        if any(
-            hook.get("command") == command
-            for entry in entries if isinstance(entry, dict)
-            for hook in entry.get("hooks", []) if isinstance(hook, dict)
-        ):
-            continue
+        kept = []
+        for entry in entries if isinstance(entries, list) else []:
+            if not isinstance(entry, dict):
+                kept.append(entry)
+                continue
+            remaining = [hook for hook in entry.get("hooks", []) if not (
+                isinstance(hook, dict)
+                and f"hooks/{script}" in str(hook.get("command", ""))
+            )]
+            if remaining:
+                updated = dict(entry)
+                updated["hooks"] = remaining
+                kept.append(updated)
+        entries[:] = kept
         entries.append({"matcher": "", "hooks": [{"type": "command", "command": command, "timeout": timeout}]})
 
     settings_path.parent.mkdir(parents=True, exist_ok=True)
@@ -97,6 +108,7 @@ def _test_engine(engine: str) -> str | None:
 def _print_report(issues: list[str], projects: list[str]) -> None:
     if not issues:
         print("\nOK — память установлена, движки отвечают, хуки записаны.")
+        print("В Codex Desktop: открой проект, выполни /hooks, проверь команду/hash и доверь hook.")
         print("Осталось провести E2E-тест отдельным чатом по инструкции INSTALL.md.")
         return
     print("\nPARTIAL — установка выполнена не полностью.")
@@ -115,6 +127,7 @@ def main() -> int:
     parser.add_argument("--caller", choices=("claude", "codex", "other"), help="agent running the installer")
     parser.add_argument("--engine", choices=ENGINES, help="primary memory engine")
     parser.add_argument("--fallback", choices=(*ENGINES, "none"), help="fallback memory engine")
+    parser.add_argument("--dry-run", action="store_true", help="print planned writes without changing files or calling providers")
     args = parser.parse_args()
     caller = args.caller or _detect_caller()
 
@@ -130,10 +143,17 @@ def main() -> int:
         if project:
             projects.append(project)
 
+    roots = [str(Path(path).expanduser().resolve()) for path in args.root]
+    if args.dry_run:
+        print(json.dumps({"status": "DRY_RUN", "tool_root": str(TOOL_ROOT),
+                          "engine": primary, "fallback": fallback,
+                          "claude_hooks": not args.no_claude, "auto_init_roots": roots,
+                          "projects": [str(Path(p).expanduser().resolve()) for p in projects]}, indent=2))
+        return 0
+
     if not args.no_claude:
         install_claude_hooks(Path.home() / ".claude" / "settings.json")
 
-    roots = [str(Path(path).expanduser().resolve()) for path in args.root]
     (TOOL_ROOT / "auto-init-roots.json").write_text(json.dumps(roots, indent=2) + "\n", encoding="utf-8")
     (TOOL_ROOT / "engine.json").write_text(
         json.dumps({"engine": primary, "fallback": fallback}, indent=2) + "\n",
@@ -144,7 +164,10 @@ def main() -> int:
     results = []
     for path in projects:
         try:
-            results.append(init(Path(path)))
+            result = init(Path(path))
+            results.append(result)
+            if result.get("status") == "needs_migration":
+                issues.append(f"Проект `{path}` требует миграции: {result.get('hint')}")
         except (OSError, SystemExit) as exc:
             issues.append(f"Не удалось подготовить проект `{path}`: {exc}")
     if not projects:

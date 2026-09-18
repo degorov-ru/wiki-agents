@@ -44,6 +44,19 @@ uv run python scripts/install.py \
 `auto-init-roots.json`, `engine.json` и `.codex/hooks.json` выбранных проектов.
 Повторный запуск безопасен и не дублирует хуки.
 
+Codex Desktop требует ручного доверия к проектному hook. Открой проект, выполни
+`/hooks`, проверь точную команду и hash из `.codex/hooks.json`, затем отметь hook
+trusted. Без этого Desktop не запускает Stop-hook. Одноразовый CLI-тест может
+использовать `--dangerously-bypass-hook-trust` только после такой проверки; сам
+продукт этот флаг не добавляет.
+
+План можно проверить без записи и без provider-вызова:
+
+```bash
+uv run python scripts/install.py --engine luna --fallback none \
+  --project "/путь/к/проекту" --dry-run
+```
+
 Если Claude Code не используется, добавь `--no-claude`. При отказе основного
 движка система сообщает ошибку и запускает выбранный fallback. Если оба
 недоступны, материал остаётся в очереди для повторной обработки.
@@ -79,6 +92,64 @@ uv run python scripts/install.py \
 движка или писать «установка завершена», если хотя бы один обязательный шаг не
 прошёл. Допустимые итоги: `OK`, `PARTIAL` с перечисленными ограничениями или
 `FAILED` с инструкцией по восстановлению.
+
+## Обслуживание и восстановление
+
+```bash
+uv run python scripts/manage.py status --project "/путь/к/проекту"
+uv run python scripts/manage.py doctor --project "/путь/к/проекту"
+uv run python scripts/manage.py pause
+uv run python scripts/manage.py resume
+uv run python scripts/manage.py upgrade --project "/путь/к/проекту"
+uv run python scripts/manage.py rollback --project "/путь/к/проекту" --backup "/точный/backup"
+uv run python scripts/manage.py uninstall --project "/путь/к/проекту"
+uv run python scripts/manage.py uninstall-claude --settings ~/.claude/settings.json
+```
+
+`upgrade` сначала создаёт backup управляемых файлов. `rollback` принимает только
+backup внутри `.cmc/backups/`. `uninstall` удаляет проектный Codex hook;
+`uninstall-claude` удаляет три глобальных Claude hook этого продукта. Оба
+сохраняют память и чужие hooks. Явный импорт поддерживает только `.md` и `.txt`:
+
+```bash
+uv run python scripts/import_source.py "/путь/к/документу.md"
+```
+
+## Обновление без потери старой установки
+
+Проверенная платформа: macOS, Python 3.12+, uv, авторизованный Luna CLI.
+Linux/Windows и доступность Haiku/Grok на другой подписке нужно проверить отдельно.
+Скачанный source-only tar.gz распакуй в новый постоянный версионный каталог.
+Не накладывай его поверх установки с незакоммиченными изменениями. В новом
+каталоге выполни `uv sync` и установку с явным engine/fallback сначала на копию
+одного проекта. Для CLI-only установки используй `--no-claude`: это оставляет
+глобальные hooks прежней установки нетронутыми.
+
+Сохрани старый каталог и машинные настройки. `manage.py upgrade` сохраняет также
+статьи wiki; `rollback --backup` возвращает их и прежние проектные hooks. Во время
+отката не запускай компиляцию: более поздние изменения управляемых файлов будут
+заменены снимком. Raw daily/sources не переписываются. Если новый global Claude
+hook ещё не устанавливался, глобального переключения и отката не требуется.
+
+### Старые статьи
+
+```bash
+uv run python scripts/manage.py migrate-articles --project "/путь/к/копии"
+uv run python scripts/manage.py migrate-articles --project "/путь/к/копии" --apply
+```
+
+Без `--apply` — только проверка. Отсутствующий kind получает `hypothesis`,
+отсутствующий status — `proposed`: это отметка непроверенной классификации,
+не утверждение ложности старого текста. Текст, даты и sources сохраняются;
+существующие статусы не повышаются до active. Повтор — NOOP. Перед применением
+создаётся управляемый backup, подходящий для обычного rollback.
+
+Если хоть одна статья невалидна, пакет изменений не применяется, результат
+`BLOCKED` содержит пути и причины. Например, ссылка на `project-management/`
+в sources требует отдельной проверенной миграции первоисточника в sources/;
+не удаляй ссылку, не выдумывай замену и не объявляй такую wiki мигрированной.
+Сначала согласуй и проверь источник, затем повтори preview. Миграция не исправляет
+старые битые wikilinks и не доказывает актуальность старых решений.
 
 ## Перед публикацией
 

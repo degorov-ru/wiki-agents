@@ -22,38 +22,45 @@ def run_luna(
     *,
     writable: bool = False,
 ) -> dict:
+    if writable:
+        raise ValueError("memory adapter is tool-free")
     started = time()
-    output_path = None
     try:
-        with tempfile.NamedTemporaryFile(prefix="cmc-luna-", suffix=".txt", delete=False) as output:
-            output_path = Path(output.name)
-        cmd = [
-            CODEX_BIN,
-            "exec",
-            "--ephemeral",
-            "--ignore-user-config",
-            "--ignore-rules",
-            "--skip-git-repo-check",
-            "--model", LUNA_MODEL,
-            "--config", f'model_reasoning_effort="{LUNA_EFFORT}"',
-            "--sandbox", "workspace-write" if writable else "read-only",
-            "--cd", str(cwd),
-            "--output-last-message", str(output_path),
-            "-",
-        ]
-        if writable:
-            cmd.insert(cmd.index("--cd"), "--approve-for-me")
-        env = os.environ.copy()
-        env["CMC_DISABLED"] = "1"
-        proc = subprocess.run(
-            cmd,
-            input=prompt,
-            capture_output=True,
-            text=True,
-            timeout=LUNA_TIMEOUT,
-            env=env,
-        )
-        text = output_path.read_text(encoding="utf-8").strip() if output_path.exists() else ""
+        with tempfile.TemporaryDirectory(prefix="cmc-luna-") as tmp:
+            isolated = Path(tmp)
+            output_path = isolated / "output.txt"
+            cmd = [
+                CODEX_BIN,
+                "exec",
+                "--strict-config",
+                "--ephemeral",
+                "--ignore-user-config",
+                "--ignore-rules",
+                "--skip-git-repo-check",
+                "--disable", "shell_tool",
+                "--disable", "unified_exec",
+                "--disable", "multi_agent",
+                "--disable", "apps",
+                "--disable", "remote_plugin",
+                "--config", 'web_search="disabled"',
+                "--model", LUNA_MODEL,
+                "--config", f'model_reasoning_effort="{LUNA_EFFORT}"',
+                "--sandbox", "read-only",
+                "--cd", str(isolated),
+                "--output-last-message", str(output_path),
+                "-",
+            ]
+            env = os.environ.copy()
+            env["CMC_DISABLED"] = "1"
+            proc = subprocess.run(
+                cmd,
+                input=prompt,
+                capture_output=True,
+                text=True,
+                timeout=LUNA_TIMEOUT,
+                env=env,
+            )
+            text = output_path.read_text(encoding="utf-8").strip() if output_path.exists() else ""
         ok = proc.returncode == 0 and bool(text)
         return {
             "ok": ok,
@@ -68,6 +75,3 @@ def run_luna(
                 "error": f"timeout after {LUNA_TIMEOUT}s"}
     except Exception as exc:
         return {"ok": False, "engine": "luna", "model": LUNA_MODEL, "error": str(exc)[-500:]}
-    finally:
-        if output_path is not None:
-            output_path.unlink(missing_ok=True)

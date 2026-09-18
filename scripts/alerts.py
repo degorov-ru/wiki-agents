@@ -6,19 +6,19 @@ import json
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
+from path_safety import append_text, managed_dir, validate_layout
 
 
 def notify(project: Path, engine: str, error: str) -> None:
-    state_dir = project / ".cmc"
-    state_dir.mkdir(parents=True, exist_ok=True)
+    project = validate_layout(project, create_state=True)
+    state_dir = managed_dir(project, ".cmc")
     record = {
         "ts": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
         "engine": engine,
         "project": str(project),
         "error": error[-500:],
     }
-    with (state_dir / "alerts.jsonl").open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    append_text(state_dir / "alerts.jsonl", json.dumps(record, ensure_ascii=False) + "\n")
 
     message = f"{engine} недоступен для {project.name}. Детали: .cmc/alerts.jsonl"
     try:

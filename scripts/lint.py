@@ -1,9 +1,6 @@
 """
 Lint the knowledge base for structural and semantic health.
 
-Runs 7 checks: broken links, orphan pages, orphan sources, stale articles,
-contradictions (LLM), missing backlinks, and sparse articles.
-
 Usage:
     uv run python lint.py                    # all checks
     uv run python lint.py --structural-only  # skip LLM checks (faster, cheaper)
@@ -13,15 +10,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import re
 from pathlib import Path
 
 from config import KNOWLEDGE_DIR, PROJECT_DIR, REPORTS_DIR, ensure_state_dir, now_iso, today_iso
 from utils import (
-    count_inbound_links,
     extract_wikilinks,
     file_hash,
     get_article_word_count,
     list_raw_files,
+    list_source_files,
     list_wiki_articles,
     load_state,
     read_all_wiki_content,
@@ -29,6 +27,8 @@ from utils import (
     save_state,
     wiki_article_exists,
 )
+from memory_contract import validate_article_semantics
+from path_safety import atomic_write_text
 
 ensure_state_dir()
 ROOT_DIR = PROJECT_DIR
@@ -41,8 +41,16 @@ def check_broken_links() -> list[dict]:
         content = article.read_text(encoding="utf-8")
         rel = article.relative_to(KNOWLEDGE_DIR)
         for link in extract_wikilinks(content):
-            if link.split("|", 1)[0].startswith("daily/"):
-                continue  # daily log references are valid
+            raw_link = link.split("|", 1)[0]
+            if raw_link.startswith("daily/"):
+                target, _, anchor = raw_link.partition("#")
+                daily = PROJECT_DIR / f"{target}.md"
+                anchor_found = daily.exists() and (not anchor or re.search(
+                    rf"(?m)^###\s+{re.escape(anchor)}(?:\s|\|$)", daily.read_text(encoding="utf-8")
+                ))
+                if not anchor_found:
+                    issues.append({"severity": "error", "check": "broken_source", "file": str(rel), "detail": f"Broken source: [[{link}]]"})
+                continue
             if not wiki_article_exists(link, article):
                 issues.append({
                     "severity": "error",
@@ -55,12 +63,19 @@ def check_broken_links() -> list[dict]:
 
 def check_orphan_pages() -> list[dict]:
     """Check for articles with zero inbound links."""
+    articles = list_wiki_articles()
+    article_paths = {article.resolve() for article in articles}
+    inbound_targets = {
+        target
+        for article in articles
+        for link in extract_wikilinks(article.read_text(encoding="utf-8"))
+        if (target := resolve_wikilink(link, article)) in article_paths
+    }
     issues = []
-    for article in list_wiki_articles():
+    for article in articles:
         rel = article.relative_to(KNOWLEDGE_DIR)
         link_target = str(rel).replace(".md", "").replace("\\", "/")
-        inbound = count_inbound_links(link_target)
-        if inbound == 0:
+        if article.resolve() not in inbound_targets:
             issues.append({
                 "severity": "warning",
                 "check": "orphan_page",
@@ -75,12 +90,13 @@ def check_orphan_sources() -> list[dict]:
     state = load_state()
     ingested = state.get("ingested", {})
     issues = []
-    for log_path in list_raw_files():
-        if log_path.name not in ingested:
+    for log_path in list_raw_files() + list_source_files():
+        rel = log_path.name if log_path.parent.name == "daily" else f"sources/{log_path.name}"
+        if rel not in ingested:
             issues.append({
                 "severity": "warning",
                 "check": "orphan_source",
-                "file": f"daily/{log_path.name}",
+                "file": rel if rel.startswith("sources/") else f"daily/{rel}",
                 "detail": f"Uncompiled daily log: {log_path.name} has not been ingested",
             })
     return issues
@@ -91,8 +107,8 @@ def check_stale_articles() -> list[dict]:
     state = load_state()
     ingested = state.get("ingested", {})
     issues = []
-    for log_path in list_raw_files():
-        rel = log_path.name
+    for log_path in list_raw_files() + list_source_files():
+        rel = log_path.name if log_path.parent.name == "daily" else f"sources/{log_path.name}"
         if rel in ingested:
             stored_hash = ingested[rel].get("hash", "")
             current_hash = file_hash(log_path)
@@ -100,7 +116,7 @@ def check_stale_articles() -> list[dict]:
                 issues.append({
                     "severity": "warning",
                     "check": "stale_article",
-                    "file": f"daily/{rel}",
+                    "file": rel if rel.startswith("sources/") else f"daily/{rel}",
                     "detail": f"Stale: {rel} has changed since last compilation",
                 })
     return issues
@@ -136,19 +152,29 @@ def check_missing_backlinks() -> list[dict]:
 
 
 def check_sparse_articles() -> list[dict]:
-    """Check for articles with fewer than 200 words."""
+    return []
+
+
+def check_article_schema() -> list[dict]:
     issues = []
     for article in list_wiki_articles():
-        word_count = get_article_word_count(article)
-        if word_count < 200:
-            rel = article.relative_to(KNOWLEDGE_DIR)
-            issues.append({
-                "severity": "suggestion",
-                "check": "sparse_article",
-                "file": str(rel),
-                "detail": f"Sparse article: {word_count} words (minimum recommended: 200)",
-            })
+        try:
+            validate_article_semantics(PROJECT_DIR, article, article.read_text(encoding="utf-8"))
+        except ValueError as exc:
+            issues.append({"severity": "error", "check": "schema", "file": str(article.relative_to(KNOWLEDGE_DIR)), "detail": str(exc)})
     return issues
+
+
+def check_index() -> list[dict]:
+    index_path = KNOWLEDGE_DIR / "index.md"
+    if not index_path.is_file() or not index_path.resolve().is_relative_to(KNOWLEDGE_DIR.resolve()):
+        return [{"severity": "error", "check": "index", "file": "index.md", "detail": "Missing or unsafe wiki index"}]
+    indexed = set(re.findall(r"\[\[((?:concepts|connections|qa)/[^\]|#]+)", index_path.read_text(encoding="utf-8")))
+    actual = {str(path.relative_to(KNOWLEDGE_DIR).with_suffix("")) for path in list_wiki_articles()}
+    return [
+        {"severity": "error", "check": "index", "file": "index.md", "detail": f"Index mismatch: {kind} [[{item}]]"}
+        for kind, items in (("missing", actual - indexed), ("stale", indexed - actual)) for item in sorted(items)
+    ]
 
 
 async def check_contradictions() -> list[dict]:
@@ -249,6 +275,10 @@ def main():
     )
     args = parser.parse_args()
 
+    if (PROJECT_DIR / ".cmc" / "purge-paused").exists():
+        print("Memory lint blocked: controlled purge is incomplete.")
+        return 1
+
     print("Running knowledge base lint checks...")
     all_issues: list[dict] = []
 
@@ -258,8 +288,8 @@ def main():
         ("Orphan pages", check_orphan_pages),
         ("Orphan sources", check_orphan_sources),
         ("Stale articles", check_stale_articles),
-        ("Missing backlinks", check_missing_backlinks),
-        ("Sparse articles", check_sparse_articles),
+        ("Article schema", check_article_schema),
+        ("Index", check_index),
     ]
 
     for name, check_fn in checks:
@@ -279,9 +309,15 @@ def main():
 
     # Generate and save report
     report = generate_report(all_issues)
+    if REPORTS_DIR.is_symlink():
+        print("Memory lint blocked: reports directory is a symlink.")
+        return 1
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    if not REPORTS_DIR.resolve().is_relative_to((PROJECT_DIR / ".cmc").resolve()):
+        print("Memory lint blocked: reports directory escapes project state.")
+        return 1
     report_path = REPORTS_DIR / f"lint-{today_iso()}.md"
-    report_path.write_text(report, encoding="utf-8")
+    atomic_write_text(report_path, report)
     print(f"\nReport saved to: {report_path}")
 
     # Update state

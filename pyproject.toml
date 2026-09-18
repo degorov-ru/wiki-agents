@@ -1,6 +1,6 @@
 [project]
-name = "llm-personal-kb"
-version = "0.1.0"
+name = "wiki-agents"
+version = "0.2.2"
 description = "Personal knowledge base compiled from AI conversations - inspired by Karpathy's LLM KB architecture"
 requires-python = ">=3.12"
 dependencies = [

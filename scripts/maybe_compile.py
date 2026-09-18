@@ -46,6 +46,7 @@ from config import (
     ensure_state_dir,
     memory_enabled,
 )
+from utils import list_raw_files, list_source_files
 
 LOCK_STALE_AFTER_SECONDS = 6 * 60 * 60
 RETRY_FAILED_AFTER_SECONDS = 6 * 60 * 60
@@ -68,8 +69,8 @@ def _has_pending_work() -> bool:
         except (json.JSONDecodeError, OSError):
             ingested = {}
 
-    for log_path in sorted(DAILY_DIR.glob("*.md")):
-        name = log_path.name
+    for log_path in list_raw_files() + list_source_files():
+        name = log_path.name if log_path.parent == DAILY_DIR else f"sources/{log_path.name}"
         if name not in ingested:
             return True
         entry = ingested[name]
@@ -90,6 +91,9 @@ def _has_pending_work() -> bool:
 
 def _setup_logging() -> None:
     ensure_state_dir()
+    if FLUSH_LOG_FILE.is_symlink():
+        logging.basicConfig(level=logging.WARNING)
+        return
     logging.basicConfig(
         filename=str(FLUSH_LOG_FILE),
         level=logging.INFO,
@@ -151,7 +155,12 @@ def trigger_if_due() -> str:
         kwargs["start_new_session"] = True
 
     try:
-        log_handle = open(str(COMPILE_LOG_FILE), "a")
+        if COMPILE_LOG_FILE.is_symlink():
+            raise ValueError("compile log is a symlink")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        log_handle = os.fdopen(os.open(COMPILE_LOG_FILE, flags, 0o600), "a")
         sp.Popen(cmd, stdout=log_handle, stderr=sp.STDOUT, **kwargs)
         spawn_marker.touch()
     except Exception as e:

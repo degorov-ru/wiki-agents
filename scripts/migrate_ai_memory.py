@@ -25,6 +25,9 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from pending import project_lock
+from memory_contract import validate_article_semantics
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
@@ -67,14 +70,21 @@ def _has_frontmatter(content: str) -> bool:
 
 
 def _wrap_with_frontmatter(content: str, title: str, sources: list[str]) -> str:
-    if _has_frontmatter(content):
-        return content
     src_yaml = "\n".join(f"  - {s}" for s in sources) if sources else "  - migrated from ai-memory/"
     today = _today()
+    if _has_frontmatter(content):
+        normalized = content.lstrip()
+        end = normalized.find("\n---", 4)
+        if end < 0:
+            raise ValueError("legacy frontmatter is incomplete")
+        content = normalized[end + 4:].lstrip()
     return (
         "---\n"
         f"title: {title}\n"
+        "kind: fact\n"
+        "status: proposed\n"
         f"created: {today}\n"
+        f"updated: {today}\n"
         "sources:\n"
         f"{src_yaml}\n"
         "tags: [migrated]\n"
@@ -83,12 +93,38 @@ def _wrap_with_frontmatter(content: str, title: str, sources: list[str]) -> str:
     )
 
 
-def migrate(project_dir: Path) -> dict:
+def _backup_source(project_dir: Path, ai_memory: Path) -> Path:
+    if ai_memory.is_symlink() or not ai_memory.resolve().is_relative_to(project_dir.resolve()):
+        raise ValueError("unsafe legacy source directory")
+    backup = project_dir / "ai-memory.migrated"
+    if backup.exists():
+        backup = project_dir / f"ai-memory.migrated-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    shutil.move(str(ai_memory), str(backup))
+    return backup
+
+
+def _migrate(project_dir: Path) -> dict:
+    project_dir = project_dir.resolve()
     ai_memory = project_dir / "ai-memory"
     wiki = project_dir / "wiki"
-    concepts = wiki / "concepts"
     daily = project_dir / "daily"
     state_dir = project_dir / ".cmc"
+    marker = state_dir / "migration.json"
+
+    for path in (ai_memory, wiki, daily, state_dir, project_dir / "sources"):
+        if path.is_symlink():
+            raise ValueError(f"migration refuses symlinked managed path: {path.name}")
+    sources_root = project_dir / "sources"
+    if sources_root.exists() and any(path.is_symlink() for path in sources_root.rglob("*")):
+        raise ValueError("migration refuses symlinks below sources/")
+
+    if marker.exists() and wiki.is_dir():
+        backup = _backup_source(project_dir, ai_memory) if ai_memory.is_dir() else None
+        marker.unlink()
+        from init_project import init
+        init(project_dir)
+        return {"status": "ok", "project_dir": str(project_dir), "recovered": True,
+                "backup_path": str(backup) if backup else None}
 
     if not ai_memory.is_dir():
         return {"status": "noop", "reason": "no ai-memory/ found"}
@@ -96,19 +132,42 @@ def migrate(project_dir: Path) -> dict:
     if wiki.exists():
         return {"status": "skip", "reason": "wiki/ already exists; refusing to overwrite"}
 
-    # Create target tree
-    concepts.mkdir(parents=True, exist_ok=True)
-    (wiki / "connections").mkdir(parents=True, exist_ok=True)
-    (wiki / "qa").mkdir(parents=True, exist_ok=True)
-    daily.mkdir(parents=True, exist_ok=True)
     state_dir.mkdir(parents=True, exist_ok=True)
+    marker.write_text(json.dumps({"schema_from": 0, "schema_to": 1}) + "\n", encoding="utf-8")
+    stage = state_dir / "migration-wiki"
+    if stage.is_symlink():
+        raise ValueError("unsafe migration staging directory")
+    if stage.exists():
+        shutil.rmtree(stage)
+    concepts = stage / "concepts"
+
+    # Build the complete wiki off to the side; one rename publishes it.
+    concepts.mkdir(parents=True, exist_ok=True)
+    (stage / "connections").mkdir(parents=True, exist_ok=True)
+    (stage / "qa").mkdir(parents=True, exist_ok=True)
+    daily.mkdir(parents=True, exist_ok=True)
 
     migrated: list[tuple[str, str]] = []  # (slug, summary)
     index_special: str | None = None
 
+    planned: list[tuple[Path, Path, str]] = []
+    slugs: set[str] = set()
     for md in sorted(ai_memory.rglob("*.md")):
+        if md.is_symlink() or not md.resolve().is_relative_to(ai_memory.resolve()):
+            raise ValueError("migration refuses symlinked legacy files")
+        relative = md.relative_to(ai_memory)
         rel_name = md.stem
-        slug = _slugify(rel_name)
+        if rel_name.upper() == "MEMORY":
+            planned.append((md, relative, ""))
+            continue
+        slug = _slugify("-".join(relative.with_suffix("").parts))
+        if slug in slugs:
+            raise ValueError(f"migration name collision: {relative}")
+        slugs.add(slug)
+        planned.append((md, relative, slug))
+
+    for md, relative, slug in planned:
+        rel_name = md.stem
         raw = md.read_text(encoding="utf-8")
         summary = _one_line_summary(raw)
 
@@ -118,13 +177,20 @@ def migrate(project_dir: Path) -> dict:
             index_special = raw
             continue
 
+        source_rel = Path("sources") / "legacy-ai-memory" / relative
+        source_target = project_dir / source_rel
+        source_target.parent.mkdir(parents=True, exist_ok=True)
+        if source_target.exists() and source_target.read_bytes() != md.read_bytes():
+            raise ValueError(f"legacy source collision: {source_rel}")
+        shutil.copy2(md, source_target)
         target = concepts / f"{slug}.md"
         wrapped = _wrap_with_frontmatter(
             raw,
             title=rel_name.replace("-", " ").replace("_", " ").title(),
-            sources=[f"ai-memory/{md.name}"],
+            sources=[source_rel.as_posix()],
         )
         target.write_text(wrapped, encoding="utf-8")
+        validate_article_semantics(project_dir, target, wrapped)
         migrated.append((slug, summary))
 
     # Build a fresh index.md
@@ -146,10 +212,10 @@ def migrate(project_dir: Path) -> dict:
     if index_special:
         index_lines += ["", "---", "", "## Notes from legacy MEMORY.md", "", index_special.strip()]
 
-    (wiki / "index.md").write_text("\n".join(index_lines) + "\n", encoding="utf-8")
+    (stage / "index.md").write_text("\n".join(index_lines) + "\n", encoding="utf-8")
 
     # log.md
-    (wiki / "log.md").write_text(
+    (stage / "log.md").write_text(
         f"# Log\n\nAppend-only chronological record of wiki changes.\n\n"
         f"---\n\n## [{_now_iso()}] migrate | ai-memory -> wiki\n"
         f"- Migrated {len(migrated)} file(s) from ai-memory/ to wiki/concepts/\n"
@@ -167,12 +233,11 @@ def migrate(project_dir: Path) -> dict:
             encoding="utf-8",
         )
 
-    # Safety net: rename instead of delete.
-    backup = project_dir / "ai-memory.migrated"
-    if backup.exists():
-        # Should be rare; keep both by appending timestamp.
-        backup = project_dir / f"ai-memory.migrated-{datetime.now().strftime('%Y%m%d%H%M%S')}"
-    shutil.move(str(ai_memory), str(backup))
+    stage.replace(wiki)
+    backup = _backup_source(project_dir, ai_memory)
+    marker.unlink()
+    from init_project import init
+    init(project_dir)
 
     return {
         "status": "ok",
@@ -180,6 +245,11 @@ def migrate(project_dir: Path) -> dict:
         "migrated_files": len(migrated),
         "backup_path": str(backup),
     }
+
+
+def migrate(project_dir: Path) -> dict:
+    with project_lock(project_dir, "migration"):
+        return _migrate(project_dir)
 
 
 def main() -> int:
