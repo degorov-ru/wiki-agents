@@ -107,6 +107,14 @@ class ManageTests(unittest.TestCase):
             self.assertEqual(3, result["removed"])
             self.assertEqual("unrelated", data["hooks"]["SessionStart"][0]["hooks"][0]["command"])
 
+    def test_doctor_points_codex_desktop_to_hook_settings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = MANAGE.doctor(Path(tmp))
+
+        trust = next(check for check in result["checks"] if check["name"] == "codex_hook_trust")
+        self.assertIn("Settings > Hooks", trust["fix"])
+        self.assertNotIn("/hooks", trust["fix"])
+
 
 if __name__ == "__main__":
     unittest.main()

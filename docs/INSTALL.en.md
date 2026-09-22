@@ -10,9 +10,16 @@
    `--caller`, `--engine`, `--fallback`, `--root`, and `--project` values.
 5. Run the separate-chat E2E check described in the Russian canonical guide.
 
-In Codex Desktop, open the project, run `/hooks`, review the exact command and
-hash from `.codex/hooks.json`, and mark it trusted. Without this manual step the
-Desktop Stop hook does not run.
+In Codex Desktop, open **Settings > Hooks**, find and review the project folder,
+then click **Trust**. Hooks run local commands automatically, so Codex keeps the
+Stop hook disabled until you explicitly trust it. Without trust, conversations
+are not written to memory. In Codex CLI, review and trust the same hook through
+`/hooks`.
+
+Claude Code uses workspace trust instead. On the first interactive session in
+the project, accept the workspace trust dialog. This permits the hooks written
+to `~/.claude/settings.json` to run. Claude Code's `/hooks` menu is read-only and
+only verifies which hooks are configured and where they came from.
 
 Use `install.py --dry-run` to inspect the plan without writes or provider calls.
 Lifecycle commands are `manage.py status|doctor|pause|resume|upgrade|rollback|uninstall|uninstall-claude`.

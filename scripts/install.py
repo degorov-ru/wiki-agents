@@ -108,7 +108,9 @@ def _test_engine(engine: str) -> str | None:
 def _print_report(issues: list[str], projects: list[str]) -> None:
     if not issues:
         print("\nOK — память установлена, движки отвечают, хуки записаны.")
-        print("В Codex Desktop: открой проект, выполни /hooks, проверь команду/hash и доверь hook.")
+        print("Codex Desktop: открой Настройки → Хуки, проверь папку проекта и нажми Доверять.")
+        print("Claude Code: при первом открытии проекта прими диалог доверия рабочей папке.")
+        print("Доверие разрешает hooks автоматически запускать локальные команды; без него память не записывается.")
         print("Осталось провести E2E-тест отдельным чатом по инструкции INSTALL.md.")
         return
     print("\nPARTIAL — установка выполнена не полностью.")

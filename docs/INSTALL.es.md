@@ -10,9 +10,17 @@
    confirmados de `--caller`, `--engine`, `--fallback`, `--root` y `--project`.
 5. Ejecuta la prueba E2E con otro chat descrita en la guía canónica rusa.
 
-En Codex Desktop, abre el proyecto, ejecuta `/hooks`, revisa el comando exacto y
-el hash de `.codex/hooks.json`, y marca el hook como confiable. Sin este paso
-manual, el hook Stop de Desktop no se ejecuta.
+En Codex Desktop, abre **Configuración > Hooks**, busca y revisa la carpeta del
+proyecto y pulsa **Confiar**. Los hooks ejecutan comandos locales automáticamente,
+por eso Codex mantiene desactivado el hook Stop hasta que lo autorices. Sin esa
+confianza, las conversaciones no se guardan en la memoria. En Codex CLI, revisa
+y autoriza el mismo hook mediante `/hooks`.
+
+Claude Code usa la confianza del espacio de trabajo. En la primera sesión
+interactiva del proyecto, acepta el diálogo de confianza de la carpeta. Esto
+permite ejecutar los hooks escritos en `~/.claude/settings.json`. El menú
+`/hooks` de Claude Code es de solo lectura: únicamente muestra los hooks y su
+origen.
 
 Usa `install.py --dry-run` para revisar el plan sin escribir ni llamar al proveedor.
 Los comandos son `manage.py status|doctor|pause|resume|upgrade|rollback|uninstall|uninstall-claude`.

@@ -51,6 +51,16 @@ class InstallTests(unittest.TestCase):
         engine.assert_not_called()
         self.assertIn('"status": "DRY_RUN"', output.getvalue())
 
+    def test_success_report_explains_codex_and_claude_trust(self):
+        with patch("sys.stdout", new_callable=io.StringIO) as output:
+            INSTALL._print_report([], ["/project"])
+
+        report = output.getvalue()
+        self.assertIn("Настройки → Хуки", report)
+        self.assertIn("диалог доверия рабочей папке", report)
+        self.assertIn("автоматически запускать локальные команды", report)
+        self.assertNotIn("выполни /hooks", report)
+
 
 if __name__ == "__main__":
     unittest.main()

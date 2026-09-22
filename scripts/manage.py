@@ -165,7 +165,7 @@ def doctor(project: Path) -> dict:
     checks.append({"name": "purge", "ok": purge_ok,
                    "fix": None if purge_ok else "review purge results, then remove .cmc/purge-paused explicitly"})
     checks.append({"name": "codex_hook_trust", "ok": False, "manual": True,
-                   "fix": "open this project in Codex, run /hooks, review the exact project hook hash, and trust it"})
+                   "fix": "in Codex Desktop open Settings > Hooks, review the project folder, and click Trust"})
     private, detail = _git_privacy(project)
     checks.append({"name": "git_privacy", "ok": private, "detail": detail,
                    "fix": None if private else "untrack memory files and keep generated memory ignored"})
