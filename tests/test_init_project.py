@@ -23,14 +23,13 @@ class InitProjectTests(unittest.TestCase):
             after = {str(p.relative_to(project)): p.read_bytes() for p in project.rglob("*") if p.is_file()}
             self.assertEqual(before, after)
 
-    def test_agents_is_canonical_and_claude_points_to_it(self) -> None:
+    def test_agents_is_only_guide(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)
             initializer.init(project)
             agents = (project / "AGENTS.md").read_text(encoding="utf-8")
-            claude = (project / "CLAUDE.md").read_text(encoding="utf-8")
             self.assertIn("single source of truth", agents)
-            self.assertIn("Read `AGENTS.md`", claude)
+            self.assertFalse((project / "CLAUDE.md").exists())
             self.assertFalse((project / "AGENT_GUIDE.md").exists())
             ignored = (project / ".gitignore").read_text(encoding="utf-8")
             self.assertIn("wiki/", ignored)
@@ -55,7 +54,7 @@ class InitProjectTests(unittest.TestCase):
         self.assertIn("'", command)
         self.assertIn("$(bad)", command)
 
-    def test_existing_legacy_guides_keep_rules_and_get_pointer(self) -> None:
+    def test_existing_legacy_guides_are_left_untouched(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)
             (project / "CLAUDE.md").write_text("Claude user rule\n", encoding="utf-8")
@@ -64,8 +63,7 @@ class InitProjectTests(unittest.TestCase):
             initializer.init(project)
             for name, rule in (("CLAUDE.md", "Claude user rule"), ("AGENT_GUIDE.md", "Legacy user rule")):
                 content = (project / name).read_text(encoding="utf-8")
-                self.assertIn(rule, content)
-                self.assertEqual(1, content.count(initializer.POINTER_BLOCK_START))
+                self.assertEqual(rule + "\n", content)
 
     def test_init_replaces_stale_codex_hook_and_preserves_other_hooks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

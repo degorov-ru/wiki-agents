@@ -16,7 +16,6 @@ Creates (idempotently):
     <project>/sources/
     <project>/.cmc/        (state, logs — gitignored)
     <project>/AGENTS.md    (single source of agent rules — only if absent)
-    <project>/CLAUDE.md    (pointer to AGENTS.md — only if absent)
     <project>/.codex/hooks.json  (Codex Stop hook — merged if present)
     <project>/.cmc-config.json  (token-budget knobs — only if absent)
     <project>/.gitignore   (adds .cmc/ entry if missing)
@@ -76,7 +75,6 @@ label when needed.
 AGENTS_TEMPLATE = """# Project Agent Guide
 
 This file is the single source of truth for coding agents and the memory compiler.
-`CLAUDE.md` points here for Claude Code compatibility.
 
 ## Goal
 
@@ -183,18 +181,6 @@ Parallel safety:
 - Agents should not assume another active agent has finished until its session has flushed into `daily/`.
 """
 
-CLAUDE_POINTER_TEMPLATE = """# Claude Project Pointer
-
-Read `AGENTS.md` in this project before doing substantial work.
-
-`AGENTS.md` is the single source of truth for:
-
-- how this project's wiki is organized;
-- what to read at agent startup;
-- what to write back before ending a substantial turn or session;
-- how Claude Code hooks, Codex, and the compiler share continuity.
-"""
-
 GITIGNORE_ENTRIES = [".cmc/", "daily/", "sources/", "wiki/", "ACCESS.md", ".cmc-config.json"]
 AGENTS_BLOCK_START = "<!-- wiki-agents:memory-start -->"
 AGENTS_BLOCK_END = "<!-- wiki-agents:memory-end -->"
@@ -203,18 +189,8 @@ AGENTS_BLOCK = f"""{AGENTS_BLOCK_START}
 
 Before substantial work, read `wiki/index.md`, the latest file in `daily/`,
 and relevant pages under `wiki/`. Keep stable facts traceable to `daily/` or
-`sources/`; never store credentials in project memory. Also read project-local
-`CLAUDE.md` and `AGENT_GUIDE.md` when present: rules outside their managed
-pointer blocks remain authoritative.
+`sources/`; never store credentials in project memory.
 {AGENTS_BLOCK_END}
-"""
-POINTER_BLOCK_START = "<!-- wiki-agents:pointer-start -->"
-POINTER_BLOCK_END = "<!-- wiki-agents:pointer-end -->"
-POINTER_BLOCK = f"""{POINTER_BLOCK_START}
-`AGENTS.md` is the canonical project guide. Read it before substantial work.
-Keep and follow any project-specific rules outside this managed block; if this
-file is `AGENT_GUIDE.md`, treat those rules as legacy until merged into AGENTS.
-{POINTER_BLOCK_END}
 """
 
 
@@ -224,7 +200,6 @@ def _preflight(project_dir: Path) -> None:
         project_dir / "wiki/concepts", project_dir / "wiki/connections",
         project_dir / "wiki/qa", project_dir / ".gitignore",
         project_dir / "ACCESS.md", project_dir / "AGENTS.md",
-        project_dir / "CLAUDE.md", project_dir / "AGENT_GUIDE.md",
         project_dir / ".cmc-config.json", project_dir / ".codex/hooks.json",
     ):
         if path.is_symlink():
@@ -269,17 +244,6 @@ def _update_agents(project_dir: Path) -> bool:
         return False
     separator = "" if not existing or existing.endswith("\n\n") else "\n" if existing.endswith("\n") else "\n\n"
     path.write_text(existing + separator + AGENTS_BLOCK + "\n", encoding="utf-8")
-    return True
-
-
-def _update_pointer(path: Path, *, create: bool) -> bool:
-    if not path.exists():
-        return _ensure(path, CLAUDE_POINTER_TEMPLATE) if create else False
-    existing = path.read_text(encoding="utf-8")
-    if POINTER_BLOCK_START in existing or "Read `AGENTS.md` in this project" in existing:
-        return False
-    separator = "" if not existing or existing.endswith("\n\n") else "\n" if existing.endswith("\n") else "\n\n"
-    path.write_text(existing + separator + POINTER_BLOCK + "\n", encoding="utf-8")
     return True
 
 
@@ -382,10 +346,6 @@ def init(project_dir: Path) -> dict:
 
     if _update_agents(project_dir):
         created.append("AGENTS.md (created or updated)")
-    if _update_pointer(project_dir / "CLAUDE.md", create=True):
-        created.append("CLAUDE.md (created or updated)")
-    if _update_pointer(project_dir / "AGENT_GUIDE.md", create=False):
-        created.append("AGENT_GUIDE.md (updated)")
 
     if _update_codex_hooks(project_dir):
         created.append(".codex/hooks.json (updated)")

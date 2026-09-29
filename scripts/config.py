@@ -64,12 +64,9 @@ COMPILE_LOG_FILE = STATE_DIR / "compile.log"
 COMPILE_RUNS_FILE = STATE_DIR / "compile-runs.jsonl"
 USER_CONFIG_FILE = PROJECT_DIR / ".cmc-config.json"
 
-# AGENTS.md is canonical. AGENT_GUIDE.md is a legacy fallback.
-AGENT_GUIDE_FILE = PROJECT_DIR / "AGENT_GUIDE.md"
-
 AGENTS_FILE = PROJECT_DIR / "AGENTS.md"
 if not AGENTS_FILE.exists():
-    AGENTS_FILE = AGENT_GUIDE_FILE if AGENT_GUIDE_FILE.exists() else TOOL_ROOT / "AGENTS.md"
+    AGENTS_FILE = TOOL_ROOT / "AGENTS.md"
 
 # Backwards-compatibility alias — older code referenced KNOWLEDGE_DIR.
 KNOWLEDGE_DIR = WIKI_DIR

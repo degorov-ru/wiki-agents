@@ -37,7 +37,15 @@ uv run python scripts/install.py \
 
 `--root` и `--project` можно повторять. `--root` разрешает SessionStart
 автоматически инициализировать дочерние проекты. `--project` сразу создаёт в
-проекте `AGENTS.md`, указатель `CLAUDE.md`, `wiki/`, `daily/` и Codex Stop-hook.
+проекте `AGENTS.md`, `wiki/`, `daily/` и Codex Stop-hook.
+
+Для старых проектов сначала проверь перенос правил из `AGENT_GUIDE.md` и
+`CLAUDE.md`, затем примени его:
+
+```bash
+uv run python scripts/migrate_agent_guides.py "/путь/к/проекту"
+uv run python scripts/migrate_agent_guides.py --apply "/путь/к/проекту"
+```
 
 Установщик сам вычисляет абсолютный путь своего клона и записывает его только в
 локальные настройки этой машины: `~/.claude/settings.json`,
