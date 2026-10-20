@@ -4,7 +4,7 @@ Codex Stop hook - capture the explicitly identified session for this project.
 Codex writes sessions as JSONL under ~/.codex/sessions. Unlike Claude Code,
 Codex Stop hooks do not hand us a Claude transcript path, so this adapter finds
 the exact Codex session whose session_meta.cwd matches the current project,
-extracts the recent user/assistant messages, and reuses scripts/flush.py.
+extracts the user/assistant messages appended since the last capture, and reuses scripts/flush.py.
 """
 
 from __future__ import annotations
@@ -86,8 +86,6 @@ def _config_int(name: str, default: int) -> int:
     return default
 
 
-MAX_TURNS = _config_int("MAX_EXTRACT_TURNS", 30)
-MAX_CONTEXT_CHARS = _config_int("MAX_EXTRACT_CHARS", 15_000)
 MIN_TURNS_TO_FLUSH = _config_int("MIN_TURNS_TO_FLUSH", 3)
 
 
@@ -251,16 +249,9 @@ def extract_codex_context_since(session_path: Path, offset: int = 0) -> tuple[st
         previous = key
         turns.append(f"**{label}:** {text}\n")
 
-    recent = turns[-MAX_TURNS:]
-    context = "\n".join(recent)
-
-    if len(context) > MAX_CONTEXT_CHARS:
-        context = context[-MAX_CONTEXT_CHARS:]
-        boundary = context.find("\n**")
-        if boundary > 0:
-            context = context[boundary + 1 :]
-
-    return context, len(recent), end_offset
+    # The cursor already limits this to unread records; truncating here would
+    # advance past text that was never flushed (same contract as transcript.py).
+    return "\n".join(turns), len(turns), end_offset
 
 
 def extract_codex_context(session_path: Path) -> tuple[str, int]:

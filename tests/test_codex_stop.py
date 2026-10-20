@@ -74,6 +74,22 @@ class FindLatestSessionTests(unittest.TestCase):
             self.assertNotIn("first", second)
             self.assertIn("second", second)
 
+    def test_long_delta_is_not_truncated_before_cursor_advances(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "project"
+            project.mkdir()
+            session = root / "codex/sessions/session.jsonl"
+            _session(session, "session-1", project)
+            module = _load_hook(project, root / "codex")
+            self._turns(session, "early decision KEEP-ME", "x" * 20_000)
+            for i in range(40):
+                self._turns(session, f"later {i}", "ok")
+            context, count, offset = module.extract_codex_context_since(session)
+            self.assertEqual(82, count)
+            self.assertIn("early decision KEEP-ME", context)
+            self.assertEqual(session.stat().st_size, offset)
+
     def test_dry_run_never_retries_or_spawns(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
