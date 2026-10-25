@@ -82,8 +82,13 @@ The schema that tells the LLM how to compile and maintain the knowledge base. Th
 
 ### `wiki/index.md` - Master Catalog
 
-A table listing every knowledge article. Query code matches index terms first,
-then sends at most six current articles within a fixed context budget to the model.
+A table listing every knowledge article. Query code searches catalog rows and
+article text, including articles missing from the catalog. It sends at most six
+articles within a fixed context budget to the model. A model reformulates only
+the question into English and original-language search terms; code ranks the
+full article texts with those terms. A bounded second pass selects up to six
+articles from relevant excerpts of at most 24 candidates. Discovery never
+depends on shortened catalog summaries or project-specific exceptions.
 
 Format:
 
@@ -269,9 +274,15 @@ When processing a daily log:
 4. Synthesize an answer with `[[wikilink]]` citations
 5. Filed Q&A is derived material and requires a separate validated proposal
 
-Selection uses deterministic index-term matching, at most six current articles,
-and a fixed context budget. It is intentionally simple and reports truncation;
+Selection uses weighted term matching over catalog rows and article text,
+at most six articles, and a fixed context budget. It reports truncation;
 no quality advantage over semantic retrieval is assumed.
+
+Memory improvements must address the shared mechanism, not particular projects.
+Do not add project names, article paths, or question-specific keyword exceptions
+to retrieval logic. Verify changes with prior failures and additional topics.
+Missing legacy status is not evidence that recorded facts are merely proposals;
+retain explicit cancelled/proposed/disputed statuses and qualify unsupported claims.
 
 ### 3. Lint (Health Checks)
 
@@ -292,10 +303,15 @@ Output: a markdown report with severity levels (error, warning, suggestion).
 
 - **Wikilinks:** Use Obsidian-style `[[path/to/article]]` without `.md` extension
 - **Writing style:** Encyclopedia-style, factual, third-person where appropriate
+- **Language:** Write Wiki titles, summaries and prose in Russian. Preserve identifiers,
+  paths, code, source references and exact quoted messages. Never translate immutable daily logs.
 - **Dates:** ISO 8601 (YYYY-MM-DD for dates, full ISO for timestamps in log.md)
 - **File naming:** lowercase, hyphens for spaces (e.g., `supabase-row-level-security.md`)
 - **Frontmatter:** Every article requires title, kind, status, updated, and sources
-- **Sources:** Always link back to the daily log(s) that contributed to an article
+- **Sources:** Always link back to the daily log(s) that contributed to an article.
+  Inherited references outside `daily/` and `sources/` may be retained only in
+  `legacy_sources`; they remain explicitly unvalidated. New legacy references
+  cannot be introduced, and canonical sources cannot be hidden in that field.
 
 ---
 
@@ -343,15 +359,15 @@ project.
 ```json
 {
   "hooks": {
-    "SessionStart": [{ "matcher": "", "hooks": [{ "type": "command", "command": "uv run python hooks/session-start.py", "timeout": 15 }] }],
-    "PreCompact": [{ "matcher": "", "hooks": [{ "type": "command", "command": "uv run python hooks/pre-compact.py", "timeout": 10 }] }],
-    "SessionEnd": [{ "matcher": "", "hooks": [{ "type": "command", "command": "uv run python hooks/session-end.py", "timeout": 10 }] }]
+    "SessionStart": [{ "matcher": "", "hooks": [{ "type": "command", "command": "/path/to/wiki-agents/.venv/bin/python3 /path/to/wiki-agents/hooks/session-start.py", "timeout": 15 }] }],
+    "PreCompact": [{ "matcher": "", "hooks": [{ "type": "command", "command": "/path/to/wiki-agents/.venv/bin/python3 /path/to/wiki-agents/hooks/pre-compact.py", "timeout": 10 }] }],
+    "SessionEnd": [{ "matcher": "", "hooks": [{ "type": "command", "command": "/path/to/wiki-agents/.venv/bin/python3 /path/to/wiki-agents/hooks/session-end.py", "timeout": 10 }] }]
   }
 }
 ```
 
-The installer generates commands with the absolute path of its clone on the
-current machine. Empty `matcher` catches all events.
+The installer uses the current Python interpreter and absolute hook paths,
+with shell quoting, without launching uv. Empty `matcher` catches all events.
 
 ### Hook Details
 
@@ -392,7 +408,9 @@ This ensures flush.py survives after Claude Code's hook process exits.
 5. The selected engine decides what's worth saving - returns structured bullet points or `FLUSH_OK`
 6. Appends result to `daily/YYYY-MM-DD.md`
 7. Cleans up temp context only after success; failures remain for retry
-8. **Scheduled auto-compilation:** If it's past 04:00 local time (`COMPILE_AFTER_HOUR = 4`) and any daily log is new or changed since its last compilation (hash comparison against `state.json`), spawns `compile.py` as another detached background process. SessionStart also runs this check, so if the computer was off at 04:00, the next session start is the fallback trigger.
+8. **Scheduled auto-compilation:** If it's past 04:00 local time (`COMPILE_AFTER_HOUR = 4`) and any daily log is new or changed since its last compilation (hash comparison against `state.json`), spawns `compile.py` as another detached background process. On macOS, the installer registers a launchd queue check every five minutes for explicitly selected projects. This retries deferred and interrupted runs without another conversation. SessionStart remains an additional trigger. Each queue pass discovers initialized projects
+under the configured project roots without following symlinks or traversing dependency
+directories. The background queue starts one compilation at a time.
 
 ### JSONL Transcript Format
 
@@ -419,6 +437,12 @@ failure.
 
 - Builds a prompt with: AGENTS.md schema, current index, all existing articles, and the daily log
 - The selected engine returns a read-only JSON proposal; code validates and writes managed paths
+- Before publication, a separate source-coverage audit checks every durable decision,
+  especially late corrections and withdrawals. One bounded repair is allowed; an
+  unresolved audit leaves the source pending. Unchanged compiled records are skipped,
+  including legacy records without `coverage_verified`; archive recompilation requires
+  an explicit `--file` or `--all`. Historical rules must be labelled as history,
+  not retained as simultaneously current. A decision does not prove implementation.
 - Incremental: tracks SHA-256 hashes of daily logs in `state.json`, skips unchanged files
 - Primary-engine failures are reported and use the configured fallback;
   unrecoverable runs stay pending and retry later
@@ -435,8 +459,18 @@ uv run python scripts/compile.py --dry-run
 
 Uses index-term retrieval and loads at most a bounded set of matching articles. No RAG.
 
-Selection is deterministic keyword matching over the structured index. The model
-sees only the bounded result and must say when that context is insufficient.
+Selection uses weighted keyword matching over the catalog and article text.
+Every question is reformulated into English and original-language terms before
+an additional full-text ranking pass. A model then selects directly relevant
+articles from bounded excerpts; the selected order is preserved. No model needs
+the entire catalog to discover candidates. The answer model sees only selected articles and must
+say when that context is insufficient. Primary articles with invalid metadata
+remain discoverable with an explicit unvalidated label; invalid derived Q&A is excluded.
+Code restricts answer citations to the exact supplied articles, resolving a shortened slug
+only when it identifies one supplied article unambiguously. An independent grounding pass
+checks claims and event dates against that context before delivery or filing. One repair
+is allowed; verifier failures and repeated unsupported answers produce an explicit refusal.
+Article update dates and the current date are never proof of an event date.
 
 **CLI:**
 ```bash

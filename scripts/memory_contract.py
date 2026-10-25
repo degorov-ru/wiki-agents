@@ -22,12 +22,19 @@ SECRET_RE = re.compile(
     r"|\b(?:sk-[A-Za-z0-9_-]{10,}|ghp_[A-Za-z0-9_]{10,}|github_pat_[A-Za-z0-9_]{10,}|xox[baprs]-[A-Za-z0-9_-]{10,})\b",
     re.IGNORECASE | re.DOTALL,
 )
+PERSONAL_RE = re.compile(
+    r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b"
+    r"|\+\d[\d ()-]{8,}\d"
+    r"|(?:ФИО|Ф\.И\.О\.|full name|customer name|дата рождения|домашний адрес|номер паспорта)\s*[:=]\s*[^\n\\]+",
+    re.IGNORECASE,
+)
 
 
 def redact_sensitive(text: str) -> tuple[str, bool]:
     """Remove common credential assignments before a provider boundary."""
     redacted, count = SECRET_RE.subn("[REDACTED_SECRET]", text)
-    return redacted, bool(count)
+    redacted, personal_count = PERSONAL_RE.subn("[REDACTED_PERSONAL]", redacted)
+    return redacted, bool(count or personal_count)
 
 
 def parse_proposal(text: str) -> dict:
@@ -90,6 +97,8 @@ def validate_article(content: str) -> None:
         raise ValueError("article kind or status is invalid")
     if not all(source.startswith(("daily/", "sources/")) for source in fields["sources"]):
         raise ValueError("every article source must name daily/ or sources/")
+    if "legacy_sources" in fields and ("legacy_sources" not in list_fields or not all(fields["legacy_sources"])):
+        raise ValueError("legacy_sources must be a non-empty list")
     if "scope" in fields and not any(scope.strip() for scope in fields["scope"]):
         raise ValueError("article scope must be a non-empty string or list")
     if fields["status"][0] == "superseded" and not fields.get("superseded_by"):
@@ -151,11 +160,21 @@ def _article_target(project_dir: Path, link: str) -> Path:
     return project_dir / "wiki" / f"{link[2:-2]}.md"
 
 
+def source_identity(source: str) -> str:
+    """Legacy source labels are annotations, not part of the source filename."""
+    match = re.fullmatch(r"((?:daily|sources)/[^\n]+?\.md(?:#[\w.-]+)?)\s+\([^()\n]*\)", source)
+    return match.group(1) if match else source
+
+
 def _validate_semantics(project_dir: Path, target: Path, content: str,
-                        pending: dict[Path, str]) -> None:
+                        pending: dict[Path, str], *, preserve_legacy_sources: bool = False) -> None:
     fields, _ = _frontmatter(content)
+    inherited_sources = set()
+    if preserve_legacy_sources and target.parent.name != "qa" and target.is_file():
+        old_fields, _ = _frontmatter(target.read_text(encoding="utf-8"))
+        inherited_sources = {source_identity(source) for source in old_fields.get("sources", [])}
     for source in fields["sources"]:
-        source_path, marker, anchor = source.partition("#")
+        source_path, marker, anchor = source_identity(source).partition("#")
         if not source_path.startswith(("daily/", "sources/")):
             raise ValueError(f"unsafe source path: {source_path}")
         raw_source = Path(source_path)
@@ -163,6 +182,8 @@ def _validate_semantics(project_dir: Path, target: Path, content: str,
             raise ValueError(f"unsafe source path: {source_path}")
         source_file = _regular_project_file(project_dir, raw_source)
         if source_file is None:
+            if source_identity(source) in inherited_sources:
+                continue
             raise ValueError(f"source does not exist: {source_path}")
         if marker:
             source_text = source_file.read_text(encoding="utf-8")
@@ -170,7 +191,7 @@ def _validate_semantics(project_dir: Path, target: Path, content: str,
                 found = re.search(rf"(?m)^###\s+{re.escape(anchor)}(?:\s|\|$)", source_text)
             else:
                 found = anchor in source_text
-            if not found:
+            if not found and source_identity(source) not in inherited_sources:
                 raise ValueError(f"source anchor does not exist: {source}")
     if len(fields["sources"]) != len(set(fields["sources"])):
         raise ValueError("duplicate source event")
@@ -205,6 +226,8 @@ def _validate_semantics(project_dir: Path, target: Path, content: str,
 def validate_article_semantics(project_dir: Path, target: Path, content: str) -> None:
     """Validate provenance and article references already present on disk."""
     validate_article(content)
+    if article_metadata(content).get("legacy_sources"):
+        raise ValueError("article has unvalidated legacy provenance")
     _validate_semantics(project_dir.resolve(), target.resolve(), content, {})
 
 
@@ -286,7 +309,7 @@ def recover_pending_commit(project_dir: Path) -> int:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
-def apply_proposal(project_dir: Path, proposal: dict) -> int:
+def apply_proposal(project_dir: Path, proposal: dict, *, expected_versions: dict | None = None) -> int:
     """Validate then atomically replace only managed wiki files."""
     project_dir = project_dir.resolve()
     changes = proposal.get("changes", [])
@@ -302,12 +325,22 @@ def apply_proposal(project_dir: Path, proposal: dict) -> int:
             raise ValueError("duplicate path or missing content")
         seen.add(target)
         expected_hashes[target] = _hash(target)
+        rel = str(target.relative_to(project_dir))
+        if expected_versions is not None and rel in expected_versions and expected_hashes[target] != expected_versions[rel]:
+            raise ValueError("managed wiki changed during model run; retry without overwriting user edits")
         if target.parent.name in {"concepts", "connections", "qa"}:
             validate_article(content)
+            if target.parent.name == "qa" and article_metadata(content).get("legacy_sources"):
+                raise ValueError("QA cannot inherit unvalidated legacy provenance")
+            old_fields = _frontmatter(target.read_text(encoding="utf-8"))[0] if target.is_file() else {}
+            new_fields, _ = _frontmatter(content)
+            permitted_legacy = {source_identity(s) for s in [*old_fields.get("legacy_sources", []),
+                *(s for s in old_fields.get("sources", []) if not source_identity(s).startswith(("daily/", "sources/")))]}
+            if not {source_identity(s) for s in new_fields.get("legacy_sources", [])}.issubset(permitted_legacy):
+                raise ValueError("cannot introduce unvalidated legacy provenance")
             if target.is_file():
-                old_fields, _ = _frontmatter(target.read_text(encoding="utf-8"))
-                new_fields, _ = _frontmatter(content)
-                if not set(old_fields.get("sources", ())).issubset(new_fields.get("sources", ())):
+                if not {source_identity(source) for source in [*old_fields.get("sources", ()), *old_fields.get("legacy_sources", ())]}.issubset(
+                        {source_identity(source) for source in [*new_fields.get("sources", ()), *new_fields.get("legacy_sources", ())]}):
                     raise ValueError("article update cannot drop provenance")
                 old_status = old_fields.get("status", [""])[0]
                 new_status = new_fields.get("status", [""])[0]
@@ -338,13 +371,19 @@ def apply_proposal(project_dir: Path, proposal: dict) -> int:
             )
         for target, content in article_targets:
             rel = str(target.relative_to(project_dir / "wiki").with_suffix(""))
-            if f"[[{rel}]]" in index:
-                continue
             fields, _ = _frontmatter(content)
             title = fields["title"][0].replace("|", " ")
-            index = index.rstrip() + (
-                f"\n| [[{rel}]] | {title} | {fields['sources'][0]} | {fields['updated'][0]} |\n"
-            )
+            body = content.split("---", 2)[-1]
+            summary = next((line.strip().lstrip('- ') for line in body.splitlines()
+                            if line.strip() and not line.lstrip().startswith('#')), title)
+            summary = re.sub(r"\[\[([^]\n]+)\]\]", lambda match: match[1].split("|")[-1], summary)
+            summary = re.sub(r"\s+", " ", summary).replace("|", " ")[:200]
+            row = f"| [[{rel}]] | {summary} | {', '.join(fields['sources'])} | {fields['updated'][0]} |"
+            lines = index.splitlines()
+            if any(f"[[{rel}]]" in line for line in lines):
+                index = '\n'.join(row if f"[[{rel}]]" in line else line for line in lines) + '\n'
+            else:
+                index = index.rstrip() + '\n' + row + '\n'
         if "index.md" in target_names:
             targets = [(target, index if target == index_target else content)
                        for target, content in targets]
@@ -381,7 +420,7 @@ def apply_proposal(project_dir: Path, proposal: dict) -> int:
                 raise ValueError(f"index references missing article: {rel}")
     for target, content in targets:
         if target.parent.name in {"concepts", "connections", "qa"}:
-            _validate_semantics(project_dir, target, content, pending)
+            _validate_semantics(project_dir, target, content, pending, preserve_legacy_sources=True)
     state_dir = project_dir / ".cmc"
     if state_dir.is_symlink():
         raise ValueError("unsafe state directory")
@@ -398,11 +437,14 @@ def apply_proposal(project_dir: Path, proposal: dict) -> int:
                 raise ValueError("memory publication is paused for purge")
             _recover_pending_commit_locked(project_dir)
             for target, expected in expected_hashes.items():
+                rel = str(target.relative_to(project_dir))
+                if expected_versions is not None and rel in expected_versions and expected != expected_versions[rel]:
+                    raise ValueError("managed wiki changed during model run; retry without overwriting user edits")
                 if _hash(target) != expected:
                     raise ValueError("managed wiki changed during proposal validation; retry")
             for target, content in targets:
                 if target.parent.name in {"concepts", "connections", "qa"}:
-                    _validate_semantics(project_dir, target, content, pending)
+                    _validate_semantics(project_dir, target, content, pending, preserve_legacy_sources=True)
             transaction_id = uuid.uuid4().hex
             transaction = state_dir / "transactions" / transaction_id
             transaction.mkdir(parents=True)

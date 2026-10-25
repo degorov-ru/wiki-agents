@@ -1,7 +1,7 @@
 """
 Decide whether to trigger compile.py in the background and do so if needed.
 
-Called from:
+Called every five minutes by scheduled_compile.py on macOS, and from:
   * flush.py at the end of a SessionEnd/PreCompact flush
   * hooks/session-start.py at the start of every session
 
@@ -31,6 +31,9 @@ from pathlib import Path
 from time import time
 
 TOOL_ROOT = Path(__file__).resolve().parent.parent
+if (TOOL_ROOT / ".auto-compile-paused").exists():
+    print("automatic compilation paused")
+    sys.exit(0)
 if (TOOL_ROOT / ".disabled-by-codex").exists() or os.environ.get("CMC_DISABLED") == "1":
     print("disabled by Codex kill-switch")
     sys.exit(0)
@@ -46,10 +49,10 @@ from config import (
     ensure_state_dir,
     memory_enabled,
 )
-from utils import list_raw_files, list_source_files
+from path_safety import managed_dir
+from pending import compile_retry_delay
 
 LOCK_STALE_AFTER_SECONDS = 6 * 60 * 60
-RETRY_FAILED_AFTER_SECONDS = 6 * 60 * 60
 MIN_SPAWN_INTERVAL_SECONDS = 30 * 60
 
 
@@ -59,9 +62,6 @@ def _file_hash(path: Path) -> str:
 
 def _has_pending_work() -> bool:
     """True if any daily log is uncompiled or has changed since last compile."""
-    if not DAILY_DIR.exists():
-        return False
-
     ingested: dict = {}
     if STATE_FILE.exists():
         try:
@@ -69,23 +69,34 @@ def _has_pending_work() -> bool:
         except (json.JSONDecodeError, OSError):
             ingested = {}
 
-    for log_path in list_raw_files() + list_source_files():
+    folder = managed_dir(PROJECT_DIR, "daily")
+    inputs = [p for p in sorted(folder.glob("*.md")) if p.is_file() and not p.is_symlink()]
+    for log_path in inputs:
         name = log_path.name if log_path.parent == DAILY_DIR else f"sources/{log_path.name}"
         if name not in ingested:
             return True
         entry = ingested[name]
-        if entry.get("hash") != _file_hash(log_path):
+        changed = entry.get("hash") != _file_hash(log_path)
+        if changed:
             return True
+        if entry.get("compiled_at"):
+            continue
         # A failed compile is retried for the same file version at most
-        # once every RETRY_FAILED_AFTER_SECONDS — never in a tight loop.
+        # with a bounded backoff — never in a tight loop.
         failed_at = entry.get("failed_at")
         if failed_at:
+            if entry.get("stage") == "permission":
+                from model_client import wiki_context_allowed
+                if wiki_context_allowed(PROJECT_DIR):
+                    return True
             try:
                 failed_ts = datetime.fromisoformat(failed_at).timestamp()
-            except ValueError:
-                continue
-            if time() - failed_ts > RETRY_FAILED_AFTER_SECONDS:
+            except (ValueError, TypeError):
                 return True
+            if time() - failed_ts > compile_retry_delay(entry):
+                return True
+            continue
+        return True
     return False
 
 
@@ -125,49 +136,62 @@ def trigger_if_due() -> str:
         if time() - spawn_marker.stat().st_mtime < MIN_SPAWN_INTERVAL_SECONDS:
             return "skip: compile spawned recently"
 
-    lock_path = PROJECT_DIR / ".cmc" / "compile.lock"
-    try:
-        if lock_path.exists():
-            age = time() - lock_path.stat().st_mtime
-            if age < LOCK_STALE_AFTER_SECONDS:
-                return "skip: compile already running"
+    from pending import project_lock
+    with project_lock(PROJECT_DIR, "compile-claim"):
+        lock_path = PROJECT_DIR / ".cmc" / "compile.lock"
+        try:
+            if lock_path.exists():
+                age = time() - lock_path.stat().st_mtime
+                try:
+                    pid = int(lock_path.read_text().split("pid=", 1)[1].splitlines()[0])
+                    if pid <= 0:
+                        raise ValueError("invalid lock pid")
+                    os.kill(pid, 0)
+                    return "skip: compile already running"
+                except ProcessLookupError:
+                    pass
+                except PermissionError:
+                    return "skip: compile already running"
+                except (ValueError, IndexError):
+                    if age < LOCK_STALE_AFTER_SECONDS:
+                        return "skip: compile already running"
+                lock_path.unlink(missing_ok=True)
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            with os.fdopen(fd, "w", encoding="utf-8") as lock:
+                lock.write(f"pid={os.getpid()}\nstarted={now.isoformat()}\n")
+        except OSError as e:
+            return f"skip: compile lock unavailable ({e})"
+
+        cmd = [
+            sys.executable, "-u", str(compile_script), "--daily-only",
+        ]
+
+        env = os.environ.copy()
+        env["CMC_PROJECT_DIR"] = str(PROJECT_DIR)
+        env["CMC_COMPILE_LOCK"] = str(lock_path)
+        env["CMC_QUEUE_COMPILE"] = "1"
+
+        kwargs: dict = {"env": env, "cwd": str(TOOL_ROOT)}
+        if sys.platform == "win32":
+            kwargs["creationflags"] = sp.CREATE_NEW_PROCESS_GROUP | sp.DETACHED_PROCESS
+        else:
+            kwargs["start_new_session"] = True
+
+        try:
+            if COMPILE_LOG_FILE.is_symlink():
+                raise ValueError("compile log is a symlink")
+            flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            log_handle = os.fdopen(os.open(COMPILE_LOG_FILE, flags, 0o600), "a")
+            with log_handle:
+                sp.Popen(cmd, stdout=log_handle, stderr=sp.STDOUT, **kwargs)
+            spawn_marker.touch()
+        except Exception as e:
             lock_path.unlink(missing_ok=True)
-        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        with os.fdopen(fd, "w", encoding="utf-8") as lock:
-            lock.write(f"pid={os.getpid()}\nstarted={now.isoformat()}\n")
-    except OSError as e:
-        return f"skip: compile lock unavailable ({e})"
+            return f"error: {e}"
 
-    cmd = [
-        "uv", "run",
-        "--directory", str(TOOL_ROOT),
-        "python", str(compile_script),
-    ]
-
-    env = os.environ.copy()
-    env["CMC_PROJECT_DIR"] = str(PROJECT_DIR)
-    env["CMC_COMPILE_LOCK"] = str(lock_path)
-
-    kwargs: dict = {"env": env, "cwd": str(TOOL_ROOT)}
-    if sys.platform == "win32":
-        kwargs["creationflags"] = sp.CREATE_NEW_PROCESS_GROUP | sp.DETACHED_PROCESS
-    else:
-        kwargs["start_new_session"] = True
-
-    try:
-        if COMPILE_LOG_FILE.is_symlink():
-            raise ValueError("compile log is a symlink")
-        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        log_handle = os.fdopen(os.open(COMPILE_LOG_FILE, flags, 0o600), "a")
-        sp.Popen(cmd, stdout=log_handle, stderr=sp.STDOUT, **kwargs)
-        spawn_marker.touch()
-    except Exception as e:
-        lock_path.unlink(missing_ok=True)
-        return f"error: {e}"
-
-    return f"spawned: compile.py for {PROJECT_DIR}"
+        return f"spawned: compile.py for {PROJECT_DIR}"
 
 
 def main() -> int:

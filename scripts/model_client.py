@@ -17,6 +17,27 @@ CONFIG_PATH = TOOL_ROOT / "engine.json"
 ENGINES = ("haiku", "luna", "grok")
 
 
+def wiki_context_allowed(project: Path) -> bool:
+    try:
+        saved = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        projects = saved.get("wiki_context_projects", [])
+        engines = saved.get("wiki_context_engines", [])
+        selected = {engine for engine in load_engines() if engine}
+        roots = saved.get("wiki_context_roots", [])
+        resolved = project.resolve()
+        registered = isinstance(projects, list) and str(resolved) in projects
+        if isinstance(roots, list):
+            registered = registered or any(
+                isinstance(root, str) and not Path(root).is_symlink()
+                and resolved != Path(root).resolve()
+                and resolved.is_relative_to(Path(root).resolve())
+                for root in roots
+            )
+        return (registered and isinstance(engines, list) and selected.issubset(engines))
+    except (OSError, ValueError, AttributeError, TypeError):
+        return False
+
+
 def load_engines() -> tuple[str, str | None]:
     try:
         saved = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
@@ -33,12 +54,12 @@ def load_engines() -> tuple[str, str | None]:
     return primary, fallback if fallback != primary else None
 
 
-def _run(engine: str, prompt: str, cwd: Path, max_turns: int, tools: tuple[str, ...]) -> dict:
+def _run(engine: str, prompt: str, cwd: Path, max_turns: int, tools: tuple[str, ...], json_schema: dict | None = None) -> dict:
     if tools:
         raise ValueError("memory models cannot receive tools")
     if engine == "grok":
         from grok_client import run_text_prompt as run_grok
-        return run_grok(prompt, cwd, max_turns=max_turns, tools=tools, fallback=False)
+        return run_grok(prompt, cwd, max_turns=max_turns, tools=tools, fallback=False, json_schema=json_schema)
     if engine == "luna":
         from luna_client import run_luna
         return run_luna(prompt, cwd, writable=False)
@@ -46,17 +67,19 @@ def _run(engine: str, prompt: str, cwd: Path, max_turns: int, tools: tuple[str, 
     return run_haiku(prompt, cwd, writable=False, max_turns=max_turns)
 
 
-def run_text_prompt(prompt: str, cwd: Path, *, max_turns: int = 2, tools: tuple[str, ...] = ()) -> dict:
+def run_text_prompt(prompt: str, cwd: Path, *, max_turns: int = 2, tools: tuple[str, ...] = (), json_schema: dict | None = None, prefer_fallback: bool = False) -> dict:
     from alerts import notify
 
     prompt, redacted = redact_sensitive(prompt)
     primary, fallback = load_engines()
-    result = _attempt(primary, prompt, cwd, max_turns, tools)
+    if prefer_fallback and fallback:
+        primary, fallback = fallback, primary
+    result = _attempt(primary, prompt, cwd, max_turns, tools, json_schema)
     if result.get("ok") or not fallback:
         result["redacted"] = redacted
         return result
     notify(cwd, primary.title(), str(result.get("error") or "unknown error"))
-    second = _attempt(fallback, prompt, cwd, max_turns, tools)
+    second = _attempt(fallback, prompt, cwd, max_turns, tools, json_schema)
     second["fallback_from"] = primary
     second["primary_error"] = result.get("error")
     if not second.get("ok"):
@@ -65,10 +88,11 @@ def run_text_prompt(prompt: str, cwd: Path, *, max_turns: int = 2, tools: tuple[
     return second
 
 
-def _attempt(engine: str, prompt: str, cwd: Path, max_turns: int, tools: tuple[str, ...]) -> dict:
+def _attempt(engine: str, prompt: str, cwd: Path, max_turns: int, tools: tuple[str, ...], json_schema: dict | None = None) -> dict:
     started = monotonic()
     try:
-        result = _run(engine, prompt, cwd, max_turns, tools)
+        kwargs = {"json_schema": json_schema} if json_schema is not None else {}
+        result = _run(engine, prompt, cwd, max_turns, tools, **kwargs)
         if not isinstance(result, dict):
             raise ValueError("adapter returned invalid result")
         result = dict(result)

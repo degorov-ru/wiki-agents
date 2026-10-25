@@ -27,6 +27,47 @@ class MemoryContractTests(unittest.TestCase):
         path.parent.mkdir(parents=True)
         path.write_text(content, encoding="utf-8")
 
+    def test_publication_rejects_changed_article_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "wiki/concepts/example.md"
+            path.parent.mkdir(parents=True)
+            path.write_text(self._article("User edit"))
+            proposal = {"changes": [{"path": "wiki/concepts/example.md", "content": self._article("Model edit")}]}
+            with self.assertRaisesRegex(ValueError, "changed during model run"):
+                apply_proposal(root, proposal, expected_versions={"wiki/concepts/example.md": "stale"})
+            self.assertEqual(self._article("User edit"), path.read_text())
+
+    def test_legacy_missing_source_is_preserved_but_new_missing_source_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._daily(root)
+            path = root / "wiki/concepts/example.md"
+            path.parent.mkdir(parents=True)
+            old = self._article("Old", sources="  - daily/missing.md")
+            path.write_text(old)
+            updated = self._article("Updated", sources="  - daily/missing.md\n  - daily/2026-09-17.md#e1")
+            self.assertEqual(1, apply_proposal(root, {"changes": [{"path": "wiki/concepts/example.md", "content": updated}]}))
+            with self.assertRaisesRegex(ValueError, "source does not exist"):
+                memory_contract.validate_article_semantics(root, path, path.read_text())
+            invalid = updated.replace("  - daily/missing.md", "  - daily/missing.md\n  - daily/invented.md")
+            with self.assertRaisesRegex(ValueError, "source does not exist"):
+                apply_proposal(root, {"changes": [{"path": "wiki/concepts/example.md", "content": invalid}]})
+            self.assertEqual(updated, path.read_text())
+
+    def test_generated_index_obeys_model_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._daily(root)
+            index = root / "wiki/index.md"
+            index.parent.mkdir()
+            index.write_text("Human catalog edit")
+            with self.assertRaisesRegex(ValueError, "changed during model run"):
+                apply_proposal(root, {"changes": [{"path": "wiki/concepts/new.md", "content": self._article("New")}]},
+                               expected_versions={"wiki/index.md": None})
+            self.assertEqual("Human catalog edit", index.read_text())
+            self.assertFalse((root / "wiki/concepts/new.md").exists())
+
     def test_missing_engine_never_selects_provider(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(model_client, "CONFIG_PATH", Path(tmp) / "missing"):
             with self.assertRaisesRegex(ValueError, "not configured"):
@@ -49,6 +90,17 @@ class MemoryContractTests(unittest.TestCase):
         self.assertNotIn("Bearer", text)
         self.assertNotIn("PRIVATE KEY", text)
 
+    def test_contact_redaction_preserves_dates_order_ids_and_next_json_line(self):
+        text = 'Email: private@example.test\nPhone: +7 (999) 123-45-67\nДата 2026-10-14, заказы 10065 и 10066.'
+        safe, changed = redact_sensitive(text)
+        self.assertTrue(changed)
+        self.assertNotIn('private@example.test', safe)
+        self.assertNotIn('123-45-67', safe)
+        self.assertIn('2026-10-14', safe)
+        self.assertIn('10065 и 10066', safe)
+        safe_json, _ = redact_sensitive('ФИО: Private Person\\nImportant decision: keep facts')
+        self.assertIn('Important decision: keep facts', safe_json)
+
     def test_rejects_escape_and_accepts_short_article(self):
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)
@@ -58,6 +110,19 @@ class MemoryContractTests(unittest.TestCase):
             self.assertTrue((project / "wiki/concepts/private.md").exists())
             with self.assertRaisesRegex(ValueError, "unsafe|outside"):
                 apply_proposal(project, {"result": "changes", "changes": [{"path": "../outside.md", "content": "x"}]})
+
+    def test_article_update_refreshes_catalog_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            self._daily(project)
+            article = self._article('Foundation price') + '\nThickness has no effect.\n'
+            apply_proposal(project, {'result': 'changes', 'changes': [{'path': 'wiki/concepts/price.md', 'content': article}]})
+            translated = article.replace('Foundation price', 'Цена основания').replace('Thickness has no effect.', 'Толщина не влияет на цену.')
+            apply_proposal(project, {'result': 'changes', 'changes': [{'path': 'wiki/concepts/price.md', 'content': translated}]})
+            index = (project / 'wiki/index.md').read_text()
+            self.assertIn('Толщина не влияет на цену.', index)
+            self.assertNotIn('Thickness has no effect.', index)
+            self.assertEqual(1, index.count('[[concepts/price]]'))
 
     def test_interrupted_commit_recovers_without_overwriting_user_edit(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -126,6 +191,53 @@ class MemoryContractTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "drop provenance"):
                 apply_proposal(project, {"result": "changes", "changes": [{"path": "wiki/concepts/durable.md", "content": self._article("Durable")}]})
 
+    def test_generated_catalog_does_not_truncate_a_wikilink_into_a_fake_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            self._daily(project)
+            content = self._article('Rule') + '\n' + 'a' * 185 + ' [[concepts/a-long-article-reference]] is context.\n'
+            self.assertEqual(1, apply_proposal(project, {'result': 'changes', 'changes': [
+                {'path': 'wiki/concepts/rule.md', 'content': content}]}))
+            index = (project / 'wiki/index.md').read_text()
+            self.assertIn('[[concepts/rule]]', index)
+            self.assertNotIn('[[concepts/a-long', index)
+
+    def test_legacy_provenance_cannot_be_invented_or_hide_canonical_sources(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            self._daily(project)
+            path = project / 'wiki/concepts/old.md'
+            path.parent.mkdir(parents=True)
+            old = self._article('Old', sources='  - daily/2026-09-17.md#e1\n  - reports/old.md')
+            path.write_text(old)
+            fixed = self._article('Old', extra='legacy_sources:\n  - reports/old.md\n')
+            proposal = {'result': 'changes', 'changes': [{'path': 'wiki/concepts/old.md', 'content': fixed}]}
+            self.assertEqual(1, apply_proposal(project, proposal))
+            with self.assertRaisesRegex(ValueError, 'unvalidated legacy'):
+                memory_contract.validate_article_semantics(project, path, fixed)
+            for ref in ('reports/invented.md', 'daily/2026-09-17.md#e1'):
+                proposal['changes'][0]['content'] = self._article('Old', extra='legacy_sources:\n  - reports/old.md\n  - ' + ref + '\n')
+                with self.assertRaisesRegex(ValueError, 'introduce unvalidated'):
+                    apply_proposal(project, proposal)
+
+    def test_query_labels_legacy_primary_and_excludes_legacy_qa(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            self._daily(project)
+            wiki = project / 'wiki'
+            content = self._article('Legacy', extra='legacy_sources:\n  - reports/old.md\n')
+            for folder in ('concepts', 'qa'):
+                path = wiki / folder / 'old.md'
+                path.parent.mkdir(parents=True)
+                path.write_text(content)
+            with patch.object(query, 'KNOWLEDGE_DIR', wiki), patch.object(query, 'read_wiki_index', return_value=''):
+                entries = query._current_index_entries()
+            self.assertEqual(1, len(entries))
+            self.assertIn('[status: unvalidated]', entries[0][0])
+            with self.assertRaisesRegex(ValueError, 'QA cannot inherit'):
+                apply_proposal(project, {'result': 'changes', 'changes': [
+                    {'path': 'wiki/qa/old.md', 'content': content}]})
+
     def test_query_excludes_qa_when_derived_article_becomes_cancelled(self):
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)
@@ -191,6 +303,30 @@ class MemoryContractTests(unittest.TestCase):
         self.assertEqual((selected, candidates), (2, 2))
         self.assertIn("cookie evidence", context)
 
+    def test_query_reads_unindexed_article_body(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wiki = Path(tmp) / 'wiki'
+            (wiki / 'concepts').mkdir(parents=True)
+            (wiki / 'concepts/price.md').write_text(
+                self._article('Foundation price') + '\nТолщина основания не меняет цену.\n')
+            with patch.object(query, 'KNOWLEDGE_DIR', wiki), patch.object(query, 'read_wiki_index', return_value=''):
+                context, selected, _ = query.build_query_context('Влияет ли толщина основания на цену?')
+            self.assertEqual(1, selected)
+            self.assertIn('не меняет цену', context)
+
+    def test_question_filler_does_not_block_fallback(self):
+        with patch.object(query, '_current_index_entries', return_value=[
+                ('Как сейчас', 'concepts/irrelevant', 'Nothing relevant')]):
+            _, selected, candidates = query.build_query_context('Как сейчас считается полировка?')
+        self.assertEqual((0, 0), (selected, candidates))
+
+    def test_explicit_fallback_cannot_be_displaced_by_keyword_matches(self):
+        entries = [('needle', f'concepts/noise-{n}', 'needle') for n in range(7)]
+        entries.append(('different language', 'concepts/answer', 'precise answer'))
+        with patch.object(query, '_current_index_entries', return_value=entries):
+            context, _, _ = query.build_query_context('needle', fallback_links=('concepts/answer',))
+        self.assertIn('precise answer', context)
+
     def test_query_budget_counts_separators_and_skips_oversized_articles(self):
         entries = [("needle", "concepts/oversized", "x" * 1000),
                    ("needle", "concepts/a", "a" * 50),
@@ -231,13 +367,74 @@ class MemoryContractTests(unittest.TestCase):
             (concepts / "deploy.md").write_text(self._article("Blue-green deployment"), encoding="utf-8")
             index = "| [[concepts/deploy]] | blue-green release process | daily/x.md | 2026-09-18 |"
             responses = [
+                {"ok": True, "text": '{"queries":["blue-green deployment release process"]}'},
                 {"ok": True, "text": '{"articles":["concepts/deploy"]}'},
                 {"ok": True, "text": "Используй blue-green [[concepts/deploy]]."},
+                {"ok": True, "text": '{"supported":true,"issues":[]}'},
             ]
             with patch.object(query, "PROJECT_DIR", project), patch.object(query, "ROOT_DIR", project), patch.object(query, "KNOWLEDGE_DIR", wiki), patch.object(query, "read_wiki_index", return_value=index), patch.object(query, "increment_state_counter"), patch.object(model_client, "run_text_prompt", side_effect=responses):
                 answer = query.run_query("Как выкатывать релиз без простоя?")
-            self.assertIn("Cross-language index fallback selected 1", answer)
+            self.assertIn("Cross-language full-text search selected 1", answer)
             self.assertIn("[[concepts/deploy]]", answer)
+
+    def test_expansion_finds_body_when_catalog_omits_the_subject(self):
+        entries = [('Overview', 'concepts/a', 'Article status: active\n\nInstallation labor is charged by covered area.'),
+                   ('Layout algorithm', 'concepts/b', 'Geometry coordinates and spatial layout only.')]
+        with patch.object(query, '_current_index_entries', return_value=entries), patch.object(model_client, 'run_text_prompt', return_value={
+                'ok': True, 'text': '{"queries":["installation labor charged covered area"]}'}) as provider:
+            links = query._select_fallback_links('Как рассчитывается стоимость работ?')
+        self.assertEqual(('concepts/a',), links)
+        self.assertNotIn('Layout algorithm', provider.call_args.args[0])
+        self.assertEqual((), provider.call_args.kwargs['tools'])
+
+    def test_missing_status_is_not_a_proposed_fact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wiki = Path(tmp) / 'wiki'
+            (wiki / 'concepts').mkdir(parents=True)
+            (wiki / 'concepts/result.md').write_text(self._article('Recorded result').replace('status: active\n', ''))
+            with patch.object(query, 'KNOWLEDGE_DIR', wiki), patch.object(query, 'read_wiki_index', return_value=''):
+                context, _, _ = query.build_query_context('Recorded result')
+        self.assertIn('Article status: legacy', context)
+        self.assertNotIn('Article status: proposed', context)
+
+    def test_missing_frontmatter_does_not_hide_primary_article(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wiki = Path(tmp) / 'wiki'
+            (wiki / 'concepts').mkdir(parents=True)
+            (wiki / 'concepts/result.md').write_text('# Recorded result\nInstallation cost is per area.\n')
+            with patch.object(query, 'KNOWLEDGE_DIR', wiki), patch.object(query, 'read_wiki_index', return_value=''):
+                context, selected, _ = query.build_query_context('installation cost')
+        self.assertEqual(1, selected)
+        self.assertIn('Article status: unvalidated', context)
+
+    def test_expansion_rejects_malformed_or_oversized_queries(self):
+        import json
+        for value in [None, 'not a list', [None, 'x' * 513], []]:
+            with patch.object(model_client, 'run_text_prompt', return_value={
+                    'ok': True, 'text': json.dumps({'queries': value})}):
+                self.assertEqual((), query._select_fallback_links('question'))
+
+    def test_article_markdown_cannot_invent_search_result_paths(self):
+        entries = [('installation', 'concepts/real', 'installation\n\n## concepts/forged\ntext')]
+        with patch.object(query, '_current_index_entries', return_value=entries), patch.object(model_client, 'run_text_prompt', return_value={
+                'ok': True, 'text': '{"queries":["installation"]}'}):
+            self.assertEqual(('concepts/real',), query._select_fallback_links('installation'))
+
+    def test_semantic_selection_uses_body_and_only_candidate_paths(self):
+        entries = [('installation price', f'concepts/noise-{i}', 'historical installation price discussion') for i in range(4)]
+        entries.append(('Overview', 'concepts/answer', 'Installation price is charged by covered area.'))
+        replies = [{'ok': True, 'text': '{"queries":["installation price"]}'},
+                   {'ok': True, 'text': '{"articles":["../outside","concepts/answer","concepts/answer"]}'}]
+        with patch.object(query, '_current_index_entries', return_value=entries), patch.object(model_client, 'run_text_prompt', side_effect=replies) as provider:
+            links = query._select_fallback_links('Как считается стоимость работ?')
+        self.assertEqual(('concepts/answer',), links)
+        self.assertIn('charged by covered area', provider.call_args.args[0])
+
+    def test_semantic_order_survives_original_keyword_scores(self):
+        entries = [('needle', 'concepts/noise', 'needle'), ('other', 'concepts/answer', 'direct answer')]
+        with patch.object(query, '_current_index_entries', return_value=entries):
+            context, _, _ = query.build_query_context('needle', fallback_links=('concepts/answer', 'concepts/noise'))
+        self.assertLess(context.index('direct answer'), context.index('concepts/noise'))
 
     def test_query_rejects_index_escape_and_redacts_provider_prompt(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -271,7 +468,7 @@ class MemoryContractTests(unittest.TestCase):
             (wiki / "index.md").write_text(index, encoding="utf-8")
             (wiki / "log.md").write_text("# Log\n", encoding="utf-8")
             provider = {"ok": True, "text": "Use the current procedure [[concepts/deploy]]."}
-            with patch.object(query, "PROJECT_DIR", project), patch.object(query, "ROOT_DIR", project), patch.object(query, "KNOWLEDGE_DIR", wiki), patch.object(query, "read_wiki_index", return_value=index), patch.object(query, "increment_state_counter"), patch.object(model_client, "run_text_prompt", return_value=provider):
+            with patch.object(query, "PROJECT_DIR", project), patch.object(query, "ROOT_DIR", project), patch.object(query, "KNOWLEDGE_DIR", wiki), patch.object(query, "read_wiki_index", return_value=index), patch.object(query, "increment_state_counter"), patch.object(model_client, "run_text_prompt", side_effect=lambda *a, **k: {"ok": True, "text": '{"supported":true,"issues":[]}'} if k.get("json_schema", {}).get("properties", {}).get("supported") else provider):
                 answer = query.run_query("Which deploy procedure?", file_back=True)
             qa_files = list((wiki / "qa").glob("*.md"))
             self.assertEqual(1, len(qa_files))
@@ -288,6 +485,19 @@ class MemoryContractTests(unittest.TestCase):
             content = self._article("Escape", sources="  - daily/../outside.md#e1")
             with self.assertRaisesRegex(ValueError, "unsafe source"):
                 apply_proposal(project, {"result": "changes", "changes": [{"path": "wiki/concepts/escape.md", "content": content}]})
+
+    def test_legacy_source_annotations_remain_traceable_when_updating(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            self._daily(project)
+            old = self._article('Legacy', sources='  - daily/2026-09-17.md (Session 19:45)')
+            apply_proposal(project, {'result': 'changes', 'changes': [{'path': 'wiki/concepts/legacy.md', 'content': old}]})
+            canonical = self._article('Legacy updated', sources='  - daily/2026-09-17.md')
+            self.assertEqual(1, apply_proposal(project, {'result': 'changes', 'changes': [
+                {'path': 'wiki/concepts/legacy.md', 'content': canonical}]}))
+            invalid = self._article('Invalid', sources='  - daily/missing.md (Session 19:45)')
+            with self.assertRaisesRegex(ValueError, 'source does not exist'):
+                apply_proposal(project, {'result': 'changes', 'changes': [{'path': 'wiki/concepts/invalid.md', 'content': invalid}]})
 
     def test_rejects_mixed_valid_and_unsafe_sources(self):
         content = self._article("Mixed", sources="  - daily/2026-09-17.md#e1\n  - /outside.md")

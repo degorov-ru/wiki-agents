@@ -53,6 +53,9 @@ class InitProjectTests(unittest.TestCase):
             command = initializer._codex_stop_command()
         self.assertIn("'", command)
         self.assertIn("$(bad)", command)
+        import shlex
+        self.assertEqual(initializer.sys.executable, shlex.split(command)[0])
+        self.assertNotIn('uv run', command)
 
     def test_existing_legacy_guides_are_left_untouched(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

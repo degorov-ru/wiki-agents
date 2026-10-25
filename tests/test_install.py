@@ -31,6 +31,8 @@ class InstallTests(unittest.TestCase):
             own = [hook for entry in data["hooks"][event] for hook in entry["hooks"]
                    if f"hooks/{script}" in hook.get("command", "")]
             self.assertEqual(1, len(own))
+            import shlex
+            self.assertEqual(sys.executable, shlex.split(own[0]['command'])[0])
 
     def test_engine_check_explains_missing_cli(self):
         with patch.object(INSTALL.shutil, "which", return_value=None):

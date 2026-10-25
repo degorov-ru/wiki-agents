@@ -8,6 +8,7 @@ import os
 import shutil
 import shlex
 import sys
+import subprocess
 from pathlib import Path
 
 from init_project import init
@@ -29,7 +30,7 @@ ENGINE_FIXES = {
 
 
 def _command(script: str) -> str:
-    return f"uv run --directory {shlex.quote(str(TOOL_ROOT))} python hooks/{shlex.quote(script)}"
+    return f"{shlex.quote(sys.executable)} {shlex.quote(str(TOOL_ROOT / 'hooks' / script))}"
 
 
 def install_claude_hooks(settings_path: Path) -> None:
@@ -157,8 +158,15 @@ def main() -> int:
         install_claude_hooks(Path.home() / ".claude" / "settings.json")
 
     (TOOL_ROOT / "auto-init-roots.json").write_text(json.dumps(roots, indent=2) + "\n", encoding="utf-8")
-    (TOOL_ROOT / "engine.json").write_text(
-        json.dumps({"engine": primary, "fallback": fallback}, indent=2) + "\n",
+    engine_path = TOOL_ROOT / "engine.json"
+    try:
+        previous = json.loads(engine_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        previous = {}
+    consent = {key: previous[key] for key in ("wiki_context_projects", "wiki_context_roots", "wiki_context_engines")
+               if isinstance(previous, dict) and key in previous}
+    engine_path.write_text(
+        json.dumps({"engine": primary, "fallback": fallback, **consent}, indent=2) + "\n",
         encoding="utf-8",
     )
 
@@ -178,6 +186,13 @@ def main() -> int:
     for engine in dict.fromkeys(filter(None, (primary, fallback))):
         if error := _test_engine(engine):
             issues.append(error)
+
+    if not issues and projects and sys.platform == "darwin":
+        try:
+            from scheduled_compile import install_schedule
+            install_schedule([Path(path) for path in projects])
+        except (OSError, RuntimeError, ValueError, subprocess.CalledProcessError) as exc:
+            issues.append(f"Не удалось включить расписание компиляции: {exc}")
 
     print(json.dumps({"tool_root": str(TOOL_ROOT), "engine": primary, "fallback": fallback,
                       "auto_init_roots": roots, "projects": results}, indent=2))

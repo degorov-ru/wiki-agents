@@ -248,8 +248,8 @@ def _update_agents(project_dir: Path) -> bool:
 
 
 def _codex_stop_command() -> str:
-    root = shlex.quote(str(Path(__file__).resolve().parent.parent))
-    return f"uv run --directory {root} python hooks/codex-stop.py"
+    hook = Path(__file__).resolve().parent.parent / 'hooks' / 'codex-stop.py'
+    return f"{shlex.quote(sys.executable)} {shlex.quote(str(hook))}"
 
 
 def _update_codex_hooks(project_dir: Path) -> bool:

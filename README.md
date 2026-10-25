@@ -29,7 +29,9 @@
 или `FAILED` с простой инструкцией исправления. Затем агент выполняет E2E-тест
 через отдельный чат по `INSTALL.md`.
 
-From there, your conversations start accumulating. After 04:00 local time, the next session start or flush automatically triggers compilation of changed daily logs into wiki articles. If the computer was off at 04:00, the next session start acts as the fallback trigger. You can also run `uv run python scripts/compile.py` manually at any time.
+На macOS установщик включает проверку очереди каждые пять минут для указанных проектов. После 04:00 по местному времени новые и изменённые журналы обрабатываются без следующего разговора. Проверки учитывают паузу между запусками и повторяют прерванные попытки; после сна обработка продолжается при возобновлении проверок. Вручную: `uv run python scripts/compile.py`.
+
+Хуки и фоновые проверки используют установленный Python без запуска `uv`. Grok получает текст без инструментов; на macOS системная песочница закрывает остальные пользовательские папки и запуск дочерних команд. Доступ ко всему диску для компиляции не нужен. Полные старые статьи для обновления передаются только при явно сохранённом разрешении для проекта и выбранных движков.
 
 ## How It Works
 
@@ -41,8 +43,8 @@ Conversation -> Claude SessionEnd/PreCompact or Codex Stop hooks -> flush.py ext
 
 - **Hooks** capture conversations automatically (Claude session end/pre-compaction and Codex Stop)
 - **flush.py** calls the configured memory engine to decide what's worth saving, retains failed inputs for retry, and after 04:00 triggers compilation automatically
-- **compile.py** validates a read-only model proposal, then code writes organized articles
-- **query.py** answers questions using index-guided retrieval (no RAG needed at personal scale)
+- **compile.py** validates a read-only model proposal, then code writes organized articles. Verified source chunks survive interrupted retries; exact edits preserve unrelated facts. Metadata is checked before the final coverage audit. The audit compares complete old/new article versions and removes prior findings from its working context only after explicit resolution acknowledgements. Inherited nonstandard references remain in `legacy_sources`, explicitly unvalidated; new references must use `daily/` or `sources/`.
+- **query.py** reformulates the question across languages, searches full article text, and selects relevant articles using bounded excerpts; missing legacy status does not imply unconfirmed facts
 - **lint.py** checks links, sources, schema, staleness, and optional contradictions
 
 ## Key Commands
@@ -71,8 +73,8 @@ layer only after measured misses justify it.
 
 ## Supported installation and updates
 
-Tested platform: macOS with Python 3.12+, `uv`, and an authenticated Luna CLI.
-Linux/Windows and live Haiku/Grok operation remain unverified. CLI hook testing
+Tested platform: macOS with Python 3.12+, `uv`, and authenticated Luna and Grok CLIs.
+Linux/Windows and live Haiku operation remain unverified. CLI hook testing
 does not establish Desktop hook trust; follow [INSTALL.md](INSTALL.md).
 
 Use a new versioned directory for updates, never overwrite a dirty installation.
@@ -90,3 +92,39 @@ are excluded. See [LICENSING.md](LICENSING.md) for provenance and licensing stat
 
 See **[AGENTS.md](AGENTS.md)** for the technical reference: article formats, hook
 architecture, script internals, known platform limits, and customization options.
+
+
+### Проверки компиляции и ответов
+
+Фоновая очередь на macOS сама находит проекты с `AGENTS.md`, `wiki/` и `daily/`
+в `~/AI Projects` и `~/Local Sites`. Она не следует по симлинкам, пропускает
+зависимости и проверяет новые проекты при каждом проходе. Одновременно очередь
+запускает одну компиляцию; прерванные и отложенные источники остаются для повтора.
+Очередь обрабатывает новые и изменённые журналы и повторяет их неудавшиеся запуски.
+После выдачи доступа прежняя ошибка разрешений больше не задерживает повтор.
+Продолжение содержательных исправлений доступно через 30 минут; ошибки провайдера
+сохраняют шестичасовую паузу, чтобы не расходовать подписку повторными сбоями.
+
+Перед публикацией отдельная проверка сверяет предложение с полным журналом,
+включая последние решения и отмены. Есть одна попытка исправления; без успешной
+проверки журнал не помечается обработанным. Старые правила сохраняются как история.
+Длинные журналы разбираются частями, но проверка каждой части получает полную
+хронологию исходного журнала, чтобы учитывать поздние решения из остальных частей.
+Существующие статьи меняются точными заменами фрагментов, без пересказа целиком.
+Это правило действует и для уже созданных неопубликованных черновиков. Для каждой
+части журнала сохраняется отдельная контрольная точка; проверенный результат
+повторно используется только при совпадении входных данных и версии проверки.
+Найденные замечания сохраняются между попытками и явно перепроверяются до публикации.
+Если статью изменили во время работы модели, публикация откладывается, чтобы сохранить чужую правку.
+Отсутствующий старый первоисточник сохраняется как ссылка, но проверка поиска и lint
+по-прежнему считают её неподтверждённой. Новые отсутствующие источники публикация отклоняет.
+
+Перед выдачей ответа проверяются ссылки на переданные статьи и обоснованность
+утверждений, включая связь дат с событиями. Неизвестные сведения не подменяются
+текущей датой или датой обновления статьи. Непроверенный ответ не сохраняется в Q&A.
+Эти проверки увеличивают число обращений к выбранной модели. Они не требуют
+перевода существующей Wiki или изменения неизменяемых журналов.
+
+Неизменённые обработанные журналы не проходят фоновую перепроверку, даже если
+у них нет новой отметки `coverage_verified`. Повторная компиляция архива запускается
+только явно через `--file` или `--all`.

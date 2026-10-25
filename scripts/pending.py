@@ -30,6 +30,13 @@ from transcript import load_offset, read_new_turns, save_offset  # noqa: E402
 from path_safety import atomic_write_text, contained_file, managed_dir, validate_layout  # noqa: E402
 
 
+def compile_retry_delay(entry: dict) -> int:
+    if (entry.get("stage") == "coverage"
+            and str(entry.get("error", "")).startswith("source coverage not verified:")):
+        return 30 * 60
+    return 6 * 60 * 60
+
+
 @contextmanager
 def project_lock(project_dir: Path, name: str = "pending"):
     project_dir = validate_layout(project_dir, create_state=True)
