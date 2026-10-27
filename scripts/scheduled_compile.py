@@ -133,6 +133,11 @@ def check_projects(projects: list[Path]) -> int:
     failed = False
     all_projects = [*discover_projects(), *projects]
     all_projects = list(dict.fromkeys(p.expanduser().resolve() for p in all_projects))
+    # A linked mirror shares another project's memory; skip it instead of blocking the queue.
+    linked = [p for p in all_projects if any((p / name).is_symlink() for name in (".cmc", "wiki", "daily"))]
+    for project in linked:
+        print(f"{project}: skip: linked memory directory", flush=True)
+    all_projects = [p for p in all_projects if p not in linked]
     def last_spawn(project: Path) -> float:
         try:
             marker = project / ".cmc/last-compile-spawn"

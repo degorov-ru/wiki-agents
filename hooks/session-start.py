@@ -28,6 +28,8 @@ if os.environ.get("CLAUDE_INVOKED_BY"):
     sys.exit(0)
 
 _TOOL_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_TOOL_ROOT / "scripts"))
+from path_safety import memory_project
 if (_TOOL_ROOT / ".disabled-by-codex").exists() or os.environ.get("CMC_DISABLED") == "1":
     sys.exit(0)
 
@@ -244,6 +246,7 @@ def _truncate(text: str, max_chars: int) -> str:
 
 
 def build_context(project_dir: Path) -> str:
+    project_dir = memory_project(project_dir)
     today = datetime.now(timezone.utc).astimezone()
     max_index, max_log_lines, max_total = _budget(project_dir)
 

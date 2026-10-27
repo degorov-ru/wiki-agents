@@ -12,7 +12,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 FORBIDDEN_ROOTS = {"daily", "wiki", "sources", ".cmc"}
-FORBIDDEN_FILES = {"ACCESS.md", "engine.json", "auto-init-roots.json", ".cmc-config.json", ".disabled-by-codex"}
+FORBIDDEN_FILES = {"ACCESS.md", "engine.json", "auto-init-roots.json", ".cmc-config.json", ".cmc-project.json", ".disabled-by-codex"}
 PRIVATE_PATH = re.compile(r"/(?:Users|home)/[A-Za-z0-9_.-]+/")
 
 

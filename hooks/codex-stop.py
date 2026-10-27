@@ -22,7 +22,7 @@ TOOL_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = TOOL_ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 from pending import project_lock, claim_flush, valid_session_id
-from path_safety import atomic_write_text, contained_file, managed_dir, validate_layout
+from path_safety import atomic_write_text, contained_file, managed_dir, validate_layout, memory_project
 
 if (TOOL_ROOT / ".disabled-by-codex").exists() or os.environ.get("CMC_DISABLED") == "1":
     sys.exit(0)
@@ -36,7 +36,7 @@ def _discover_project_dir() -> Path:
     return Path.cwd().resolve()
 
 
-PROJECT_DIR = _discover_project_dir()
+PROJECT_DIR = memory_project(_discover_project_dir())
 WIKI_DIR = PROJECT_DIR / "wiki"
 STATE_DIR = PROJECT_DIR / ".cmc"
 CODEX_STATE_FILE = STATE_DIR / "codex-last-flush.json"
@@ -155,7 +155,7 @@ def _find_latest_session() -> tuple[Path | None, str]:
         if _safe_session(path):
             meta = _session_meta(path)
             cwd = meta.get("cwd")
-            if cwd and str(Path(cwd).expanduser().resolve()) == str(PROJECT_DIR):
+            if cwd and memory_project(Path(cwd)) == PROJECT_DIR:
                 session_id = str(meta.get("id") or "")
                 if valid_session_id(session_id) and (not explicit_id or str(explicit_id) == session_id):
                     return path, session_id
@@ -169,7 +169,7 @@ def _find_latest_session() -> tuple[Path | None, str]:
         session_id = str(meta.get("id") or "")
         if explicit_id and session_id == str(explicit_id):
             cwd = meta.get("cwd")
-            if cwd and str(Path(cwd).expanduser().resolve()) == project_str:
+            if cwd and str(memory_project(Path(cwd))) == project_str:
                 return path, session_id
 
     return None, "unknown"

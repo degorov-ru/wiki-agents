@@ -43,7 +43,7 @@ Conversation -> Claude SessionEnd/PreCompact or Codex Stop hooks -> flush.py ext
 
 - **Hooks** capture conversations automatically (Claude session end/pre-compaction and Codex Stop)
 - **flush.py** calls the configured memory engine to decide what's worth saving, retains failed inputs for retry, and after 04:00 triggers compilation automatically
-- **compile.py** validates a read-only model proposal, then code writes organized articles. Verified source chunks survive interrupted retries; exact edits preserve unrelated facts. Metadata is checked before the final coverage audit. The audit compares complete old/new article versions and removes prior findings from its working context only after explicit resolution acknowledgements. Inherited nonstandard references remain in `legacy_sources`, explicitly unvalidated; new references must use `daily/` or `sources/`.
+- **compile.py** selects articles before editing their complete text. Exact fragment edits preserve unrelated facts; code owns metadata, the catalog and atomic publication. A content audit blocks factual errors; completeness warnings are recorded separately. Verified chunks survive interrupted retries for identical inputs and compiler versions. Inherited nonstandard references remain explicitly unvalidated in `legacy_sources`.
 - **query.py** reformulates the question across languages, searches full article text, and selects relevant articles using bounded excerpts; missing legacy status does not imply unconfirmed facts
 - **lint.py** checks links, sources, schema, staleness, and optional contradictions
 
@@ -105,16 +105,17 @@ architecture, script internals, known platform limits, and customization options
 Продолжение содержательных исправлений доступно через 30 минут; ошибки провайдера
 сохраняют шестичасовую паузу, чтобы не расходовать подписку повторными сбоями.
 
-Перед публикацией отдельная проверка сверяет предложение с полным журналом,
-включая последние решения и отмены. Есть одна попытка исправления; без успешной
-проверки журнал не помечается обработанным. Старые правила сохраняются как история.
-Длинные журналы разбираются частями, но проверка каждой части получает полную
-хронологию исходного журнала, чтобы учитывать поздние решения из остальных частей.
-Существующие статьи меняются точными заменами фрагментов, без пересказа целиком.
-Это правило действует и для уже созданных неопубликованных черновиков. Для каждой
-части журнала сохраняется отдельная контрольная точка; проверенный результат
-повторно используется только при совпадении входных данных и версии проверки.
-Найденные замечания сохраняются между попытками и явно перепроверяются до публикации.
+Сначала модель выбирает существующие статьи по каталогу. Затем получает их полный
+текст и возвращает точные замены фрагментов и новые статьи. Пересказ целой старой
+статьи запрещён. При ошибке формата допускается одно исправление в том же формате.
+Код сохраняет источники и управляет метаданными и каталогом.
+Перед публикацией отдельная проверка блокирует выдумки, потери старых фактов и
+противоречия последним решениям. Есть одна попытка содержательного исправления.
+Пропущенные подробности записываются отдельно в `coverage_warnings`, без блокировки
+журнала. Успешная проверка не означает гарантированной полноты всей Wiki.
+Длинные журналы разбираются частями с полной хронологией для учёта поздних решений.
+Все части публикуются вместе. Проверенная часть повторно используется только при
+совпадении источника, Wiki и версии компилятора.
 Если статью изменили во время работы модели, публикация откладывается, чтобы сохранить чужую правку.
 Отсутствующий старый первоисточник сохраняется как ссылка, но проверка поиска и lint
 по-прежнему считают её неподтверждённой. Новые отсутствующие источники публикация отклоняет.

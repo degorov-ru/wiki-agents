@@ -64,7 +64,7 @@ def _run(engine: str, prompt: str, cwd: Path, max_turns: int, tools: tuple[str, 
         from luna_client import run_luna
         return run_luna(prompt, cwd, writable=False)
     from claude_client import run_haiku
-    return run_haiku(prompt, cwd, writable=False, max_turns=max_turns)
+    return run_haiku(prompt, cwd, writable=False, max_turns=max_turns, json_schema=json_schema)
 
 
 def run_text_prompt(prompt: str, cwd: Path, *, max_turns: int = 2, tools: tuple[str, ...] = (), json_schema: dict | None = None, prefer_fallback: bool = False) -> dict:

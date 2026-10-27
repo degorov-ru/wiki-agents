@@ -162,6 +162,21 @@ class ScheduleTests(unittest.TestCase):
                 self.assertEqual(1, scheduler.check_projects([project]))
                 self.assertEqual(0, run.call_count)
 
+    def test_linked_mirror_is_skipped_without_blocking_queue(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp).resolve()
+            real, mirror = base / 'real', base / 'mirror'
+            (real / 'wiki').mkdir(parents=True)
+            (real / '.cmc').mkdir()
+            mirror.mkdir()
+            (mirror / '.cmc').symlink_to(real / '.cmc')
+            (mirror / 'wiki').symlink_to(real / 'wiki')
+            result = type('Result', (), {'stdout': 'spawned: compile.py', 'returncode': 0})()
+            with patch.object(scheduler, 'PROJECT_ROOTS', ()), \
+                    patch.object(scheduler.subprocess, 'run', return_value=result) as run:
+                self.assertEqual(0, scheduler.check_projects([mirror, real]))
+            self.assertEqual(str(real), run.call_args.kwargs['env']['CMC_PROJECT_DIR'])
+
     def test_changed_daily_stays_pending_and_imports_are_not_scheduled(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp).resolve()

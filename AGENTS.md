@@ -435,14 +435,28 @@ Uses the engine selected during installation. `scripts/model_client.py` routes
 the same prompt to Haiku, Luna, or Grok and invokes the configured fallback on
 failure.
 
-- Builds a prompt with: AGENTS.md schema, current index, all existing articles, and the daily log
-- The selected engine returns a read-only JSON proposal; code validates and writes managed paths
-- Before publication, a separate source-coverage audit checks every durable decision,
-  especially late corrections and withdrawals. One bounded repair is allowed; an
-  unresolved audit leaves the source pending. Unchanged compiled records are skipped,
-  including legacy records without `coverage_verified`; archive recompilation requires
-  an explicit `--file` or `--all`. Historical rules must be labelled as history,
-  not retained as simultaneously current. A decision does not prove implementation.
+Existing article edits require an exact, unique source fragment. Similarity
+thresholds must not substitute for exact matching, including for numbers or negations.
+For sources touching many large articles, reduce `chunk_chars` in the canonical
+project's `.cmc-config.json`; `CMC_CHUNK_CHARS` overrides it for a single run.
+
+Local checkouts may use a regular `.cmc-project.json` containing
+`{"project": "/absolute/path/to/canonical/project"}`. Hooks, compilation and queries resolve
+this pointer before accessing memory. The target must have real `wiki/` and
+`daily/` directories; pointer chains and symlinked managed directories are rejected.
+Subdirectories inherit the nearest project pointer or initialized memory root.
+
+- Selects relevant existing articles from the catalog before drafting changes, then
+  supplies their complete text for exact fragment edits. Models return only edits
+  and new articles; code owns metadata, the catalog and publication.
+- One format is used for edits, with one correction attempt against the same bases.
+  A separate content audit blocks invented claims, lost old facts and contradictions;
+  omitted durable details are recorded as non-blocking `coverage_warnings`.
+  One factual repair is allowed; unresolved errors leave the source pending.
+- Verified chunks are cached only for identical sources, Wiki and compiler version.
+  All chunks publish together. Unchanged compiled records are skipped; archive
+  recompilation requires an explicit `--file` or `--all`. Historical rules must be
+  labelled as history. A decision does not prove implementation.
 - Incremental: tracks SHA-256 hashes of daily logs in `state.json`, skips unchanged files
 - Primary-engine failures are reported and use the configured fallback;
   unrecoverable runs stay pending and retry later
@@ -553,3 +567,11 @@ The knowledge base is pure markdown with `[[wikilinks]]` - works natively in Obs
 
 If measured retrieval misses become unacceptable, add a tested search layer before
 the model. The current implementation already bounds articles and context size.
+
+<!-- wiki-agents:memory-start -->
+## Project memory
+
+Before substantial work, read `wiki/index.md`, the latest file in `daily/`,
+and relevant pages under `wiki/`. Keep stable facts traceable to `daily/` or
+`sources/`; never store credentials in project memory.
+<!-- wiki-agents:memory-end -->

@@ -31,7 +31,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from path_safety import validate_layout
+from path_safety import validate_layout, memory_project
 
 
 DEFAULT_CONFIG = {
@@ -306,7 +306,7 @@ def _update_codex_hooks(project_dir: Path) -> bool:
 
 
 def init(project_dir: Path) -> dict:
-    project_dir = project_dir.expanduser().resolve()
+    project_dir = memory_project(project_dir, inherit=False)
     if not project_dir.is_dir():
         raise SystemExit(f"Not a directory: {project_dir}")
     _preflight(project_dir)

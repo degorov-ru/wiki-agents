@@ -32,7 +32,7 @@ if (TOOL_ROOT / ".disabled-by-codex").exists() or os.environ.get("CMC_DISABLED")
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from path_safety import managed_dir, validate_layout
+from path_safety import managed_dir, validate_layout, memory_project
 
 
 def _discover_project_dir() -> Path:
@@ -45,7 +45,7 @@ def _discover_project_dir() -> Path:
 
 
 def main() -> int:
-    project_dir = _discover_project_dir()
+    project_dir = memory_project(_discover_project_dir())
     try:
         validate_layout(project_dir)
     except ValueError:

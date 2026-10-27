@@ -16,20 +16,30 @@ HAIKU_MODEL = os.environ.get("CMC_HAIKU_MODEL", "haiku")
 TIMEOUT = int(os.environ.get("CMC_HAIKU_TIMEOUT", "600"))
 
 
-def run_haiku(prompt: str, cwd: Path, *, writable: bool = False, max_turns: int = 2) -> dict:
+def run_haiku(prompt: str, cwd: Path, *, writable: bool = False, max_turns: int = 2,
+              json_schema: dict | None = None) -> dict:
     if writable:
         raise ValueError("memory adapter is tool-free")
     cmd = [
         CLAUDE_BIN, "-p", prompt, "--output-format", "json", "--model", HAIKU_MODEL,
-        "--max-turns", str(max_turns), "--bare", "--no-session-persistence",
+        # --bare skips subscription (OAuth) login; isolate via empty settings and MCP instead.
+        "--max-turns", str(max_turns), "--no-session-persistence",
+        "--setting-sources", "", "--strict-mcp-config",
         "--tools", "", "--allowedTools", "",
     ]
+    if json_schema:
+        # Structured output spends one extra turn on its internal answer tool.
+        cmd[cmd.index("--max-turns") + 1] = str(max(max_turns, 3))
+        cmd += ["--json-schema", json.dumps(json_schema)]
     started = time()
     try:
         with tempfile.TemporaryDirectory(prefix="cmc-haiku-") as isolated:
-            proc = subprocess.run(cmd, cwd=isolated, capture_output=True, text=True, timeout=TIMEOUT)
+            proc = subprocess.run(cmd, cwd=isolated, capture_output=True, text=True, timeout=TIMEOUT,
+                                  env=dict(os.environ, CLAUDE_INVOKED_BY="memory_flush"))
         data = json.loads(proc.stdout) if proc.returncode == 0 else {}
-        text = str(data.get("result") or data.get("text") or "").strip()
+        structured = data.get("structured_output")
+        text = (json.dumps(structured, ensure_ascii=False) if json_schema and structured is not None
+                else str(data.get("result") or data.get("text") or "").strip())
         ok = proc.returncode == 0 and not data.get("is_error") and bool(text)
         return {
             "ok": ok, "engine": "haiku", "model": HAIKU_MODEL, "text": text,

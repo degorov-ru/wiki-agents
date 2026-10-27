@@ -28,7 +28,7 @@ if os.environ.get("CLAUDE_INVOKED_BY"):
 TOOL_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = TOOL_ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
-from path_safety import managed_dir, validate_layout
+from path_safety import managed_dir, validate_layout, memory_project
 
 if (TOOL_ROOT / ".disabled-by-codex").exists() or os.environ.get("CMC_DISABLED") == "1":
     sys.exit(0)
@@ -63,7 +63,7 @@ def _load_project_config(project_dir: Path) -> dict:
         return {}
 
 
-PROJECT_DIR = _discover_project_dir()
+PROJECT_DIR = memory_project(_discover_project_dir())
 WIKI_DIR = PROJECT_DIR / "wiki"
 STATE_DIR = PROJECT_DIR / ".cmc"
 

@@ -23,6 +23,7 @@ import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
+from path_safety import memory_project
 
 
 # ── Project root discovery ─────────────────────────────────────────────
@@ -33,8 +34,8 @@ def _discover_project_dir() -> Path:
         if val:
             p = Path(val).expanduser().resolve()
             if p.exists():
-                return p
-    return Path(os.getcwd()).resolve()
+                return memory_project(p)
+    return memory_project(Path(os.getcwd()))
 
 
 PROJECT_DIR = _discover_project_dir()
@@ -81,6 +82,7 @@ _DEFAULTS = {
     "max_extract_turns": 30,
     "max_extract_chars": 15_000,
     "compile_after_hour": 4,
+    "chunk_chars": 40_000,
 }
 
 
@@ -113,6 +115,7 @@ MIN_TURNS_TO_FLUSH = _config_value("min_turns_to_flush")
 MAX_EXTRACT_TURNS = _config_value("max_extract_turns")
 MAX_EXTRACT_CHARS = _config_value("max_extract_chars")
 COMPILE_AFTER_HOUR = _config_value("compile_after_hour")
+CHUNK_CHARS = _config_value("chunk_chars")
 
 
 # ── Timezone / clock helpers ───────────────────────────────────────────

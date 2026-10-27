@@ -66,15 +66,13 @@ class SyntheticProductE2ETests(unittest.TestCase):
                 daily = sorted((project / 'daily').glob('*.md'))[-1]
                 source = f'daily/{{daily.name}}'
                 article = {article_template!r}.format(source=source)
-                proposal = json.dumps({{'result':'changes','changes':[
-                    {{'path':'wiki/concepts/blue-widgets.md','content':article}},
-                    {{'path':'wiki/index.md','content':'# Wiki Index\\n\\n| Article | Summary | Source | Updated |\\n|---|---|---|---|\\n| [[concepts/blue-widgets]] | Blue | '+source+' | 2026-09-18 |\\n'}},
-                    {{'path':'wiki/log.md','content':'# Log\\n\\ncompiled blue widgets\\n'}}
+                proposal = json.dumps({{'edits': [], 'creates': [
+                    {{'path':'wiki/concepts/blue-widgets.md','content':article}}
                 ]}})
                 spec = importlib.util.spec_from_file_location('compiler_e2e', root / 'scripts/compile.py')
                 compiler = importlib.util.module_from_spec(spec); spec.loader.exec_module(compiler)
                 state = {{}}
-                with patch.object(model_client, 'run_text_prompt', return_value={{'ok': True, 'engine':'fake', 'text':proposal}}):
+                with patch.object(model_client, 'run_text_prompt', side_effect=lambda *a, **k: {{'ok': True, 'engine':'fake', 'text':json.dumps({{'errors': [], 'warnings': []}}) if 'errors' in k.get('json_schema', {{}}).get('properties', {{}}) else proposal}}):
                     asyncio.run(compiler.compile_daily_log(daily, state))
                 assert daily.name in state['ingested']
                 assert (project / 'wiki/concepts/blue-widgets.md').exists()

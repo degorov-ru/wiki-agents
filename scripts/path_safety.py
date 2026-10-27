@@ -1,11 +1,38 @@
 """Fail-closed helpers for project-owned runtime paths."""
 
 import os
+import json
 import tempfile
 from pathlib import Path
 
 
 MANAGED_DIRS = (".cmc", ".codex", "daily", "sources", "wiki")
+
+
+def memory_project(directory: Path, *, inherit: bool = True) -> Path:
+    """Resolve an explicit memory pointer before checking managed directories."""
+    directory = directory.expanduser().resolve()
+    for parent in (directory, *directory.parents):
+        pointer = parent / ".cmc-project.json"
+        if pointer.is_symlink():
+            raise ValueError("memory pointer must be a regular file")
+        if pointer.exists():
+            data = json.loads(pointer.read_text(encoding="utf-8"))
+            target = data.get("project") if isinstance(data, dict) else None
+            if not isinstance(target, str) or not Path(target).is_absolute():
+                raise ValueError("memory pointer requires an absolute project path")
+            project = Path(target).resolve()
+            validate_layout(project)
+            target_pointer = project / ".cmc-project.json"
+            if target_pointer.exists() or target_pointer.is_symlink() or not all(
+                (project / name).is_dir() for name in ("wiki", "daily")
+            ):
+                raise ValueError("memory pointer must target an initialized canonical project")
+            return project
+        if inherit and all((parent / name).is_dir() and not (parent / name).is_symlink()
+               for name in ("wiki", "daily")):
+            return parent
+    return directory
 
 
 def managed_dir(project: Path, name: str, *, create: bool = False) -> Path:
