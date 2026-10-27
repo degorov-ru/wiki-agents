@@ -75,9 +75,9 @@ KNOWLEDGE_DIR = WIKI_DIR
 
 # ── Tunable defaults (the "context-size regulator") ────────────────────
 _DEFAULTS = {
-    "max_index_chars": 10_000,
+    "max_index_chars": 4_000,
     "max_log_lines": 30,
-    "max_total_chars": 15_000,
+    "max_total_chars": 9_000,
     "min_turns_to_flush": 3,
     "max_extract_turns": 30,
     "max_extract_chars": 15_000,

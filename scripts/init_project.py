@@ -35,9 +35,9 @@ from path_safety import validate_layout, memory_project
 
 
 DEFAULT_CONFIG = {
-    "max_index_chars": 10000,
+    "max_index_chars": 4000,
     "max_log_lines": 30,
-    "max_total_chars": 15000,
+    "max_total_chars": 9000,
     "min_turns_to_flush": 3,
     "min_turns_to_flush_compact": 5,
     "max_extract_turns": 30,

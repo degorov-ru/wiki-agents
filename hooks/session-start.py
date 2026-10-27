@@ -71,9 +71,9 @@ def _load_project_config(project_dir: Path) -> dict:
 
 def _budget(project_dir: Path) -> tuple[int, int, int]:
     cfg = _load_project_config(project_dir)
-    max_index = int(cfg.get("max_index_chars", _config_int("MAX_INDEX_CHARS", 10_000)))
+    max_index = int(cfg.get("max_index_chars", _config_int("MAX_INDEX_CHARS", 4_000)))
     max_log_lines = int(cfg.get("max_log_lines", _config_int("MAX_LOG_LINES", 30)))
-    max_total = int(cfg.get("max_total_chars", _config_int("MAX_TOTAL_CHARS", 15_000)))
+    max_total = int(cfg.get("max_total_chars", _config_int("MAX_TOTAL_CHARS", 9_000)))
     return max_index, max_log_lines, max_total
 
 
